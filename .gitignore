@@ -1,0 +1,29 @@
+# Build output
+/build/
+/build-*/
+*.o
+*.obj
+*.a
+*.lib
+
+# CMake FetchContent dependency checkouts / caches
+/_deps/
+**/_deps/
+
+# Emscripten output
+*.wasm
+*.html.mem
+cooped.html
+cooped.js
+cooped.data
+
+# Editor / OS noise
+.cache/
+compile_commands.json
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Generated docs preview
+/DESIGN.html
