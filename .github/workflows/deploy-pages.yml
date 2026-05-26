@@ -1,0 +1,63 @@
+name: Deploy web build to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; cancel in-progress runs for new pushes.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest                  # pin to a specific emsdk version for reproducibility
+          actions-cache-folder: emsdk-cache # cache the toolchain between runs
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure (Emscripten)
+        run: emcmake cmake -S . -B build-web -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (cooped target only)
+        # Building just our target skips bimg_encode, which uses x86 intrinsics unavailable on wasm.
+        run: cmake --build build-web --target cooped
+
+      - name: Assemble Pages site
+        run: |
+          mkdir -p _site
+          cp build-web/cooped.html _site/index.html   # Pages serves index.html by default
+          cp build-web/cooped.js   _site/cooped.js     # html references these by basename
+          cp build-web/cooped.wasm _site/cooped.wasm
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true                 # turn on Pages (source = GitHub Actions) if not already
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
