@@ -1,3 +1,6 @@
+# Emscripten SDK (local toolchain checkout)
+/emsdk/
+
 # Build output
 /build/
 /build-*/

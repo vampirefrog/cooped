@@ -18,8 +18,8 @@ No shaders/geometry yet — that's milestone 2.
 - CMake ≥ 3.20, a C++17 compiler, and Ninja (or Make).
 - Git (dependencies are fetched at configure time via CMake `FetchContent`).
 - Network access on the first configure (to clone SDL3 + bgfx).
-- For the web build: the [Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html)
-  (`emcc` / `emcmake` on your `PATH`).
+- For the web build: the Emscripten SDK. A local checkout is vendored at `./emsdk/`
+  (gitignored); activate it with `source ./emsdk/emsdk_env.sh`.
 
 ## Build & run — desktop
 
@@ -36,13 +36,18 @@ quits.
 ## Build & run — browser (WebAssembly)
 
 ```sh
-# from an activated emsdk environment (emsdk_env.sh)
+source ./emsdk/emsdk_env.sh
 emcmake cmake -S . -B build-web -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build-web
-emrun build-web/cooped.html        # or serve the dir over http and open cooped.html
+cmake --build build-web --target cooped     # build only our target (see note below)
+emrun build-web/cooped.html                 # or serve the dir over http and open cooped.html
 ```
 
 The same scene renders via WebGL2 in the tab.
+
+> **Why `--target cooped` for the web build:** bgfx.cmake also defines `bimg_encode` (the offline
+> texture-compression encoder), which uses x86 CRC32 intrinsics that don't exist on wasm. We don't
+> link it, so building only the `cooped` target skips it. The web build also enables `-msimd128`
+> (in `CMakeLists.txt`) because bx/bgfx pass SSE flags that Emscripten requires wasm SIMD alongside.
 
 ## Dependency versions
 

@@ -8,6 +8,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
 
+# bgfx/bx apply SSE flags (e.g. -msse4.2) to their sources. Under Emscripten, em++ requires
+# -msimd128 whenever an SSE flag is present, so enable wasm SIMD globally for the web build.
+# Must be set before FetchContent_MakeAvailable so it applies to the dependency targets too.
+if(EMSCRIPTEN)
+  add_compile_options(-msimd128)
+endif()
+
 # ---------------------------------------------------------------------------
 # Dependencies (pinned; bump tags as desired — see README).
 # Milestone 1 only needs SDL3 (window/input/loop) and bgfx (rendering).
