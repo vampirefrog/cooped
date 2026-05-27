@@ -27,6 +27,7 @@ namespace {
 constexpr uint16_t kDefaultPort = 27500;  // ENet UDP; WebSocket signaling = this + 1
 
 uint32_t g_nextId = 1;
+LightmapData g_lightmap;                     // latest bake: shipped to joiners, persisted, cleared on edits
 bool g_dirty = false;                       // map changed since last save
 volatile std::sig_atomic_t g_running = 1;   // cleared by SIGINT/SIGTERM for a clean save-on-exit
 
@@ -36,12 +37,15 @@ void onSignal(int) { g_running = 0; }
 bool saveMap(const char* path, const std::vector<Brush>& brushes, const std::vector<Light>& lights) {
 	ByteWriter w;
 	w.u8('C'); w.u8('M'); w.u8('A'); w.u8('P');  // magic
-	w.u32(2);                                     // version
+	w.u32(3);                                     // version (3 = adds optional baked lightmap)
 	w.u32(g_nextId);
 	w.u32((uint32_t)brushes.size());
 	for (const Brush& b : brushes) writeBrush(w, b);
 	w.u32((uint32_t)lights.size());
 	for (const Light& l : lights) writeLight(w, l);
+	const bool hasLm = g_lightmap.valid();
+	w.u8(hasLm ? 1 : 0);
+	if (hasLm) writeLightmap(w, g_lightmap);
 	FILE* f = fopen(path, "wb");
 	if (!f) return false;
 	const bool ok = fwrite(w.data.data(), 1, w.data.size(), f) == w.data.size();
@@ -61,7 +65,7 @@ bool loadMap(const char* path, std::vector<Brush>& brushes, std::vector<Light>& 
 	if (got != buf.size() || buf.size() < 16) return false;
 	ByteReader r(buf.data(), buf.size());
 	if (r.u8() != 'C' || r.u8() != 'M' || r.u8() != 'A' || r.u8() != 'P') return false;
-	r.u32();                       // version
+	const uint32_t version = r.u32();
 	g_nextId = r.u32();
 	const uint32_t n = r.u32();
 	std::vector<Brush> loaded;
@@ -71,6 +75,10 @@ bool loadMap(const char* path, std::vector<Brush>& brushes, std::vector<Light>& 
 	std::vector<Light> loadedLights;
 	for (uint32_t i = 0; i < ln && r.ok; ++i) loadedLights.push_back(readLight(r));
 	if (!r.ok || loadedLights.size() != ln) return false;
+	if (version >= 3 && r.u8() == 1) {   // optional baked lightmap
+		LightmapData lm = readLightmap(r);
+		if (r.ok && lm.valid()) g_lightmap = std::move(lm);
+	}
 	brushes = std::move(loaded);
 	lights = std::move(loadedLights);
 	return true;
@@ -207,6 +215,12 @@ std::vector<uint8_t> applyOp(std::vector<Brush>& brushes, std::vector<Light>& li
 				}
 			return msgSetFaceUV(id, face, us, vs, uo, vo, rot);
 		}
+		case MsgType::Lightmap: {
+			LightmapData lm = readLightmap(r);
+			if (!r.ok || !lm.valid()) return {};
+			g_lightmap = std::move(lm);
+			return msgLightmap(g_lightmap);  // rebroadcast to everyone (and persist via g_dirty)
+		}
 		default:
 			return {};
 	}
@@ -237,7 +251,13 @@ void handleClientMessage(std::vector<Brush>& brushes, std::vector<Light>& lights
 		return;
 	}
 	const std::vector<uint8_t> rb = applyOp(brushes, lights, data, len);
-	if (!rb.empty()) { broadcastAll(host, rb); g_dirty = true; }
+	if (!rb.empty()) {
+		broadcastAll(host, rb);
+		g_dirty = true;
+		// Any geometry/light change makes the stored bake stale; texture swaps don't affect it.
+		const MsgType mt = (MsgType)data[0];
+		if (mt != MsgType::Lightmap && mt != MsgType::SetFaceTexture) g_lightmap = LightmapData{};
+	}
 }
 
 // Build the PlayerStates broadcast from everyone who has reported a position.
@@ -343,6 +363,7 @@ void drainRtc(std::vector<Brush>& brushes, std::vector<Light>& lights, ENetHost*
 				printf("browser client joined as player %u (%zu brushes)\n", pid, brushes.size());
 				sendToChannel(m.dc, msgAssignId(pid, kProtocolVersion));
 				sendToChannel(m.dc, msgSnapshot(brushes, lights));
+				if (g_lightmap.valid()) sendToChannel(m.dc, msgLightmap(g_lightmap));
 				break;
 			}
 			case InKind::Data: {
@@ -420,6 +441,7 @@ int main(int argc, char** argv) {
 					printf("native client connected as player %u\n", pid);
 					sendENet(ev.peer, msgAssignId(pid, kProtocolVersion));
 					sendENet(ev.peer, msgSnapshot(brushes, lights));
+					if (g_lightmap.valid()) sendENet(ev.peer, msgLightmap(g_lightmap));
 					break;
 				}
 				case ENET_EVENT_TYPE_RECEIVE: {

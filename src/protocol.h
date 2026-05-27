@@ -12,7 +12,7 @@
 
 // Bump on any wire-format change. The server sends it in AssignId; the client compares and
 // surfaces a clear mismatch instead of silently rendering a garbled map.
-constexpr uint32_t kProtocolVersion = 5;
+constexpr uint32_t kProtocolVersion = 6;
 
 enum class MsgType : uint8_t {
 	Snapshot       = 1,  // server->client: full map
@@ -28,6 +28,7 @@ enum class MsgType : uint8_t {
 	CreateLight    = 11, // client: pos+color+radius (id=0); server: with assigned id
 	DeleteLight    = 12, // light id
 	SetLightPos    = 13, // light id + position
+	Lightmap       = 14, // baked lightmap: atlas size + RGBM RGBA8 pixels + per-soup-vertex UVs
 };
 
 struct ByteWriter {
@@ -36,6 +37,7 @@ struct ByteWriter {
 	void u32(uint32_t v) { const uint8_t* p = (const uint8_t*)&v; data.insert(data.end(), p, p + 4); }
 	void f32(float v) { const uint8_t* p = (const uint8_t*)&v; data.insert(data.end(), p, p + 4); }
 	void vec3(const bx::Vec3& v) { f32(v.x); f32(v.y); f32(v.z); }
+	void bytes(const void* d, size_t n) { const uint8_t* p = (const uint8_t*)d; data.insert(data.end(), p, p + n); }
 };
 
 struct ByteReader {
@@ -47,6 +49,8 @@ struct ByteReader {
 	uint32_t u32() { uint32_t v = 0; if (p + 4 > end) { ok = false; return 0; } memcpy(&v, p, 4); p += 4; return v; }
 	float f32() { float v = 0; if (p + 4 > end) { ok = false; return 0; } memcpy(&v, p, 4); p += 4; return v; }
 	bx::Vec3 vec3() { const float x = f32(), y = f32(), z = f32(); return bx::Vec3(x, y, z); }
+	// Borrow n raw bytes from the stream (no copy); null + ok=false if it would overrun.
+	const uint8_t* take(size_t n) { if (p + n > end) { ok = false; return nullptr; } const uint8_t* r = p; p += n; return r; }
 };
 
 inline void writeBrush(ByteWriter& w, const Brush& b) {
@@ -91,6 +95,44 @@ inline Light readLight(ByteReader& r) {
 	l.color[0] = r.f32(); l.color[1] = r.f32(); l.color[2] = r.f32();
 	l.radius = r.f32();
 	return l;
+}
+
+// A baked lightmap as shipped over the wire / persisted: RGBM-encoded RGBA8 atlas plus the
+// per-world-soup-vertex lightmap UVs (the soup is built in brush order, so every client that
+// rebuilds its meshes in that same order maps into the atlas identically).
+struct LightmapData {
+	uint32_t w = 0, h = 0;
+	std::vector<uint8_t> pixels;   // RGBA8 (RGBM), w*h*4
+	std::vector<float> vertexUV;   // 2 per soup vertex
+	bool valid() const { return w > 0 && h > 0 && pixels.size() == (size_t)w * h * 4; }
+};
+
+inline void writeLightmap(ByteWriter& w, const LightmapData& lm) {
+	w.u32(lm.w); w.u32(lm.h);
+	w.u32((uint32_t)lm.pixels.size());
+	w.bytes(lm.pixels.data(), lm.pixels.size());
+	w.u32((uint32_t)lm.vertexUV.size());
+	w.bytes(lm.vertexUV.data(), lm.vertexUV.size() * sizeof(float));
+}
+
+inline LightmapData readLightmap(ByteReader& r) {
+	LightmapData lm;
+	lm.w = r.u32(); lm.h = r.u32();
+	const uint32_t pn = r.u32();
+	if (const uint8_t* pp = r.take(pn)) lm.pixels.assign(pp, pp + pn);
+	const uint32_t vn = r.u32();
+	if (const uint8_t* vp = r.take((size_t)vn * sizeof(float))) {
+		lm.vertexUV.resize(vn);
+		if (vn) memcpy(lm.vertexUV.data(), vp, (size_t)vn * sizeof(float));
+	}
+	return lm;
+}
+
+inline std::vector<uint8_t> msgLightmap(const LightmapData& lm) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::Lightmap);
+	writeLightmap(w, lm);
+	return w.data;
 }
 
 inline std::vector<uint8_t> msgSnapshot(const std::vector<Brush>& brushes,

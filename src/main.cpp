@@ -329,6 +329,19 @@ void rebuildSceneMeshesLightmap(App* app, const std::vector<float>& vertexUV) {
 	}
 }
 
+// Upload an RGBM lightmap atlas and rebind the meshes' lightmap UVs (used by a local F6 bake
+// and by a lightmap received from the server — the latter works on web, no Embree needed).
+void applyLightmapTexture(App* app, uint32_t w, uint32_t h, const std::vector<uint8_t>& pixels,
+                          const std::vector<float>& vertexUV) {
+	if (pixels.size() != (size_t)w * h * 4) return;
+	if (bgfx::isValid(app->lightmapTex)) bgfx::destroy(app->lightmapTex);
+	app->lightmapTex = bgfx::createTexture2D((uint16_t)w, (uint16_t)h, false, 1,
+	    bgfx::TextureFormat::RGBA8, BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+	    bgfx::copy(pixels.data(), (uint32_t)pixels.size()));
+	rebuildSceneMeshesLightmap(app, vertexUV);
+	app->hasLightmap = true;
+}
+
 void rebuildGrid(App* app) {
 	app->grid.destroy();
 	std::vector<BrushVertex> verts;
@@ -745,6 +758,11 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			}
 			break;
 		}
+		case MsgType::Lightmap: {  // server shipped a baked lightmap (on join or after a peer's F6)
+			const LightmapData lm = readLightmap(r);
+			if (r.ok && lm.valid()) applyLightmapTexture(app, lm.w, lm.h, lm.pixels, lm.vertexUV);
+			break;
+		}
 		case MsgType::PlayerState:  // client->server only
 			break;
 	}
@@ -1021,13 +1039,13 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 						case SDLK_F6: {  // GI bake: unwrap + shadowed direct light, then display it
 							const BakeResult br = bakeLightmaps(app->brushes, app->lights);
 							if (br.ok && !br.pixels.empty()) {
-								if (bgfx::isValid(app->lightmapTex)) bgfx::destroy(app->lightmapTex);
-								app->lightmapTex = bgfx::createTexture2D(
-								    (uint16_t)br.atlasWidth, (uint16_t)br.atlasHeight, false, 1,
-								    bgfx::TextureFormat::RGBA8, BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-								    bgfx::copy(br.pixels.data(), (uint32_t)br.pixels.size()));
-								rebuildSceneMeshesLightmap(app, br.vertexUV);  // sets lightmap UVs on meshes
-								app->hasLightmap = true;
+								applyLightmapTexture(app, br.atlasWidth, br.atlasHeight, br.pixels, br.vertexUV);
+								if (app->online) {  // persist + share: server stores and ships it to everyone
+									LightmapData lm;
+									lm.w = br.atlasWidth; lm.h = br.atlasHeight;
+									lm.pixels = br.pixels; lm.vertexUV = br.vertexUV;
+									sendMsg(app, msgLightmap(lm));
+								}
 							}
 							SDL_Log("bake: ok=%d atlas %ux%u charts=%u", br.ok, br.atlasWidth, br.atlasHeight,
 							        br.chartCount);
