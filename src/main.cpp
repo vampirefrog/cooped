@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "brush.h"
+#include "physics.h"
 
 #include "shaders/generated/glsl/vs_world.sc.bin.h"
 #include "shaders/generated/essl/vs_world.sc.bin.h"
@@ -27,6 +28,16 @@
 namespace {
 
 constexpr float kGridExtent = 2048.0f;  // half-size of the rendered grid
+
+// Player physics constants (Quake-scale units).
+const bx::Vec3 kPlayerHalf(16.0f, 16.0f, 28.0f);  // 32 x 32 x 56 AABB
+constexpr float kEyeOffset = 20.0f;   // eye height above the player centre
+constexpr float kGravity   = 800.0f;   // jump felt fine — leave vertical alone
+constexpr float kJumpSpeed = 270.0f;
+constexpr float kMaxSpeed  = 320.0f;
+constexpr float kGroundAccel = 18.0f;  // reach/change speed fast (was 10 — felt floaty horizontally)
+constexpr float kAirAccel    = 8.0f;   // strong air steering (was 1 = near-locked momentum)
+constexpr float kFriction    = 12.0f;  // stop quickly when keys released (was 6 — slidey)
 
 bgfx::ShaderHandle makeShader(const uint8_t* data, uint32_t size) {
 	return bgfx::createShader(bgfx::copy(data, size));
@@ -86,6 +97,11 @@ struct App {
 	std::vector<std::vector<Brush>> undoStack, redoStack;
 
 	Camera cam;
+	// Play-mode player body (collision/gravity); in edit mode cam.pos is a free-fly camera.
+	bx::Vec3 playerPos{0, 0, 64};
+	bx::Vec3 playerVel{0, 0, 0};
+	bool onGround = false;
+
 	bool editMode = true;
 	int  selected = -1;      // selected brush index, or -1
 	int  selectedFace = -1;  // selected face on that brush (the push/pull target)
@@ -99,6 +115,16 @@ struct App {
 };
 
 float snapToGrid(float v, float step) { return bx::round(v / step) * step; }
+
+// Quake acceleration: ramp velocity toward wishDir up to wishSpeed.
+void accelerate(bx::Vec3& vel, const bx::Vec3& wishDir, float wishSpeed, float accel, float dt) {
+	const float current = bx::dot(vel, wishDir);
+	const float add = wishSpeed - current;
+	if (add <= 0.0f) return;
+	float accelSpeed = accel * dt * wishSpeed;
+	if (accelSpeed > add) accelSpeed = add;
+	vel = bx::add(vel, bx::mul(wishDir, accelSpeed));
+}
 
 Mesh buildMeshFromBrush(const Brush& brush, const bgfx::VertexLayout& layout) {
 	std::vector<BrushVertex> verts;
@@ -374,6 +400,11 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 					app->editMode = !app->editMode;
 					app->selected = -1;
 					app->selectedFace = -1;
+					if (!app->editMode) {  // entering play: drop the body in at the fly-cam eye
+						app->playerPos = bx::sub(app->cam.pos, bx::Vec3(0, 0, kEyeOffset));
+						app->playerVel = bx::Vec3(0, 0, 0);
+						app->onGround = false;
+					}
 					break;
 				default: break;
 			}
@@ -424,16 +455,50 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	const bool* keys = SDL_GetKeyboardState(nullptr);
 	const bx::Vec3 fwd = app->cam.forward();
 	const bx::Vec3 worldUp{0.0f, 0.0f, 1.0f};
-	const bx::Vec3 right = bx::normalize(bx::cross(worldUp, fwd));
-	const float speed = (keys[SDL_SCANCODE_LSHIFT] ? 700.0f : 250.0f) * dt;
-	bx::Vec3 move{0, 0, 0};
-	if (keys[SDL_SCANCODE_W]) move = bx::add(move, fwd);
-	if (keys[SDL_SCANCODE_S]) move = bx::sub(move, fwd);
-	if (keys[SDL_SCANCODE_D]) move = bx::add(move, right);
-	if (keys[SDL_SCANCODE_A]) move = bx::sub(move, right);
-	if (keys[SDL_SCANCODE_SPACE]) move = bx::add(move, worldUp);
-	if (keys[SDL_SCANCODE_LCTRL]) move = bx::sub(move, worldUp);
-	if (bx::length(move) > 0.0f) app->cam.pos = bx::add(app->cam.pos, bx::mul(bx::normalize(move), speed));
+
+	if (app->editMode) {
+		// Free-fly camera.
+		const bx::Vec3 right = bx::normalize(bx::cross(worldUp, fwd));
+		const float speed = (keys[SDL_SCANCODE_LSHIFT] ? 700.0f : 250.0f) * dt;
+		bx::Vec3 move{0, 0, 0};
+		if (keys[SDL_SCANCODE_W]) move = bx::add(move, fwd);
+		if (keys[SDL_SCANCODE_S]) move = bx::sub(move, fwd);
+		if (keys[SDL_SCANCODE_D]) move = bx::add(move, right);
+		if (keys[SDL_SCANCODE_A]) move = bx::sub(move, right);
+		if (keys[SDL_SCANCODE_SPACE]) move = bx::add(move, worldUp);
+		if (keys[SDL_SCANCODE_LCTRL]) move = bx::sub(move, worldUp);
+		if (bx::length(move) > 0.0f)
+			app->cam.pos = bx::add(app->cam.pos, bx::mul(bx::normalize(move), speed));
+	} else {
+		// Walking player: gravity + WASD on the ground plane, collide against brushes.
+		bx::Vec3 fwdH(fwd.x, fwd.y, 0.0f);
+		if (bx::length(fwdH) > 1.0e-4f) fwdH = bx::normalize(fwdH);
+		const bx::Vec3 rightH = bx::normalize(bx::cross(worldUp, fwdH));
+		bx::Vec3 wish{0, 0, 0};
+		if (keys[SDL_SCANCODE_W]) wish = bx::add(wish, fwdH);
+		if (keys[SDL_SCANCODE_S]) wish = bx::sub(wish, fwdH);
+		if (keys[SDL_SCANCODE_D]) wish = bx::add(wish, rightH);
+		if (keys[SDL_SCANCODE_A]) wish = bx::sub(wish, rightH);
+		const bx::Vec3 wishDir = (bx::length(wish) > 0.0f) ? bx::normalize(wish) : bx::Vec3(0, 0, 0);
+
+		app->playerVel.z -= kGravity * dt;
+		if (app->onGround) {
+			const float sp = bx::sqrt(app->playerVel.x * app->playerVel.x +
+			                          app->playerVel.y * app->playerVel.y);
+			if (sp > 0.0f) {  // horizontal friction
+				const float ns = bx::max(sp - sp * kFriction * dt, 0.0f) / sp;
+				app->playerVel.x *= ns;
+				app->playerVel.y *= ns;
+			}
+			accelerate(app->playerVel, wishDir, kMaxSpeed, kGroundAccel, dt);
+			if (keys[SDL_SCANCODE_SPACE]) { app->playerVel.z = kJumpSpeed; app->onGround = false; }
+		} else {
+			accelerate(app->playerVel, wishDir, kMaxSpeed, kAirAccel, dt);
+		}
+
+		app->onGround = movePlayer(app->brushes, app->playerPos, app->playerVel, kPlayerHalf, dt);
+		app->cam.pos = bx::add(app->playerPos, bx::Vec3(0, 0, kEyeOffset));
+	}
 
 	updateTargeted(app);
 
@@ -505,7 +570,8 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
 		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  [ ]:grid  Ctrl+Z/Y:undo/redo  E:play");
 	} else {
-		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY (fly)   E:edit   esc:quit");
+		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   E:edit   esc:quit",
+		                    app->onGround ? "[grounded]" : "[airborne]");
 	}
 
 	bgfx::frame();

@@ -86,6 +86,7 @@ endif()
 add_executable(cooped
   src/main.cpp
   src/brush.cpp
+  src/physics.cpp
 )
 target_include_directories(cooped PRIVATE src)
 # Ensure the embedded shader headers are (re)generated before main.cpp compiles (native only).
