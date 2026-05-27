@@ -43,6 +43,7 @@ jobs:
           cp build-web/cooped.html _site/index.html   # Pages serves index.html by default
           cp build-web/cooped.js   _site/cooped.js     # html references these by basename
           cp build-web/cooped.wasm _site/cooped.wasm
+          cp build-web/cooped.data _site/cooped.data   # preloaded asset pack (textures)
 
       - uses: actions/configure-pages@v5
         with:
