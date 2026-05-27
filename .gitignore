@@ -4,6 +4,9 @@
 # Saved maps (server persistence output)
 *.map
 
+# TLS certs/keys — never commit private keys
+/certs/
+
 # Build output
 /build/
 /build-*/
