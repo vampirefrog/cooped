@@ -12,11 +12,14 @@
 #include <bx/math.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
 #include "brush.h"
+#include "net.h"
 #include "physics.h"
+#include "protocol.h"
 
 #include "shaders/generated/glsl/vs_world.sc.bin.h"
 #include "shaders/generated/essl/vs_world.sc.bin.h"
@@ -96,6 +99,12 @@ struct App {
 
 	std::vector<std::vector<Brush>> undoStack, redoStack;
 
+	// Networking (Milestone 5). When online, edits are sent to the server and applied on echo.
+	NetClient* net = nullptr;
+	bool online = false;
+	bool selectOnNextCreate = false;  // select the next CreateBrush echo as ours
+	uint32_t localNextId = 1;         // id source for single-player (offline) brushes
+
 	Camera cam;
 	// Play-mode player body (collision/gravity); in edit mode cam.pos is a free-fly camera.
 	bx::Vec3 playerPos{0, 0, 64};
@@ -103,11 +112,11 @@ struct App {
 	bool onGround = false;
 
 	bool editMode = true;
-	int  selected = -1;      // selected brush index, or -1
-	int  selectedFace = -1;  // selected face on that brush (the push/pull target)
-	int  targeted = -1;      // brush under the crosshair this frame
-	int  targetedFace = -1;  // face of that brush under the crosshair
-	int  ppBrush = -1, ppFace = -1;  // active push/pull face, for undo coalescing
+	uint32_t selectedId = 0;     // selected brush id (0 = none) — id-based so it survives net edits
+	int  selectedFace = -1;      // selected face on that brush (the push/pull target)
+	int  targeted = -1;          // brush index under the crosshair this frame
+	int  targetedFace = -1;      // face of that brush under the crosshair
+	uint32_t ppId = 0; int ppFace = -1;  // active push/pull face, for undo coalescing
 	float gridStep = 64.0f;
 
 	float mouseDx = 0.0f, mouseDy = 0.0f;
@@ -115,6 +124,14 @@ struct App {
 };
 
 float snapToGrid(float v, float step) { return bx::round(v / step) * step; }
+
+// Index of the brush with the given id, or -1.
+int indexOfId(const std::vector<Brush>& brushes, uint32_t id) {
+	if (id == 0) return -1;
+	for (int i = 0; i < (int)brushes.size(); ++i)
+		if (brushes[i].id == id) return i;
+	return -1;
+}
 
 // Quake acceleration: ramp velocity toward wishDir up to wishSpeed.
 void accelerate(bx::Vec3& vel, const bx::Vec3& wishDir, float wishSpeed, float accel, float dt) {
@@ -149,7 +166,6 @@ void rebuildSceneMeshes(App* app) {
 	app->meshes.clear();
 	app->meshes.reserve(app->brushes.size());
 	for (const Brush& b : app->brushes) app->meshes.push_back(buildMeshFromBrush(b, app->layout));
-	if (app->selected >= (int)app->brushes.size()) app->selected = -1;
 }
 
 void rebuildGrid(App* app) {
@@ -176,7 +192,11 @@ void rebuildGrid(App* app) {
 	app->grid.numIndices = uint32_t(idx.size());
 }
 
-void resetPushPull(App* app) { app->ppBrush = -1; app->ppFace = -1; }
+void resetPushPull(App* app) { app->ppId = 0; app->ppFace = -1; }
+
+void sendMsg(App* app, const std::vector<uint8_t>& m) {
+	netSend(app->net, m.data(), m.size(), true);
+}
 
 void pushUndo(App* app) {
 	app->undoStack.push_back(app->brushes);
@@ -184,41 +204,47 @@ void pushUndo(App* app) {
 	if (app->undoStack.size() > 128) app->undoStack.erase(app->undoStack.begin());
 }
 
+// Undo/redo are local-only (single-player). Collaborative undo isn't supported in Milestone 5.
 void undo(App* app) {
-	if (app->undoStack.empty()) return;
+	if (app->online || app->undoStack.empty()) return;
 	app->redoStack.push_back(app->brushes);
 	app->brushes = app->undoStack.back();
 	app->undoStack.pop_back();
-	app->selected = -1;
+	app->selectedId = 0;
 	app->selectedFace = -1;
 	resetPushPull(app);
 	rebuildSceneMeshes(app);
 }
 
 void redo(App* app) {
-	if (app->redoStack.empty()) return;
+	if (app->online || app->redoStack.empty()) return;
 	app->undoStack.push_back(app->brushes);
 	app->brushes = app->redoStack.back();
 	app->redoStack.pop_back();
-	app->selected = -1;
+	app->selectedId = 0;
 	app->selectedFace = -1;
 	resetPushPull(app);
 	rebuildSceneMeshes(app);
 }
 
 // Sauerbraten-style: push (out) or pull (in) the SELECTED face along its normal by one grid
-// step. No clamp — pulling past the brush's vertices is allowed (it cuts the brush, and the
-// plane is kept), so pushing back out restores the geometry. The face stays the push/pull
-// target until deselected. Consecutive edits to one face coalesce into a single undo entry.
+// step. No clamp — pulling past the brush's vertices cuts it, and pushing back restores it.
+// Online: send the new plane distance to the server (applied on echo). Offline: mutate locally.
 void pushPullFace(App* app, int dir) {
-	const int bi = app->selected, fi = app->selectedFace;
-	if (bi < 0 || fi < 0 || bi >= (int)app->brushes.size()) return;
-	if (bi != app->ppBrush || fi != app->ppFace) {
+	const int bi = indexOfId(app->brushes, app->selectedId);
+	const int fi = app->selectedFace;
+	if (bi < 0 || fi < 0 || fi >= (int)app->brushes[bi].planes.size()) return;
+	const float newD = app->brushes[bi].planes[fi].d + dir * app->gridStep;
+	if (app->online) {
+		sendMsg(app, msgSetPlaneD(app->selectedId, (uint32_t)fi, newD));
+		return;
+	}
+	if (app->selectedId != app->ppId || fi != app->ppFace) {  // coalesce a scroll session into one undo
 		pushUndo(app);
-		app->ppBrush = bi;
+		app->ppId = app->selectedId;
 		app->ppFace = fi;
 	}
-	app->brushes[bi].planes[fi].d += dir * app->gridStep;
+	app->brushes[bi].planes[fi].d = newD;
 	app->meshes[bi].destroy();
 	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);  // may be empty if collapsed
 }
@@ -237,31 +263,125 @@ void createBrushAtAim(App* app) {
 	if (!aimGroundPoint(app, app->cam.forward(), g)) return;
 	const float s = app->gridStep;
 	const bx::Vec3 center{snapToGrid(g.x, s), snapToGrid(g.y, s), s * 0.5f};
+	Brush b = makeBox(center, {s * 0.5f, s * 0.5f, s * 0.5f}, 0.70f, 0.55f, 0.40f);
+	if (app->online) {
+		app->selectOnNextCreate = true;  // server assigns the id; select it when it echoes back
+		sendMsg(app, msgCreateBrush(b));
+		return;
+	}
 	pushUndo(app);
-	app->brushes.push_back(makeBox(center, {s * 0.5f, s * 0.5f, s * 0.5f}, 0.70f, 0.55f, 0.40f));
-	app->selected = (int)app->brushes.size() - 1;
+	b.id = app->localNextId++;
+	app->brushes.push_back(b);
+	app->selectedId = b.id;
 	app->selectedFace = -1;
 	resetPushPull(app);
 	rebuildSceneMeshes(app);
 }
 
 void deleteSelected(App* app) {
-	if (app->selected < 0 || app->selected >= (int)app->brushes.size()) return;
+	const int bi = indexOfId(app->brushes, app->selectedId);
+	if (bi < 0) return;
+	if (app->online) {
+		sendMsg(app, msgDeleteBrush(app->selectedId));
+		app->selectedId = 0;
+		app->selectedFace = -1;
+		resetPushPull(app);
+		return;
+	}
 	pushUndo(app);
-	app->brushes.erase(app->brushes.begin() + app->selected);
-	app->selected = -1;
+	app->brushes.erase(app->brushes.begin() + bi);
+	app->selectedId = 0;
 	app->selectedFace = -1;
 	resetPushPull(app);
 	rebuildSceneMeshes(app);
 }
 
 void nudgeSelected(App* app, const bx::Vec3& dir) {
-	if (app->selected < 0) return;
+	const int bi = indexOfId(app->brushes, app->selectedId);
+	if (bi < 0) return;
+	const bx::Vec3 delta = bx::mul(dir, app->gridStep);
+	if (app->online) {
+		sendMsg(app, msgTranslateBrush(app->selectedId, delta));
+		return;
+	}
 	pushUndo(app);
 	resetPushPull(app);
-	translateBrush(app->brushes[app->selected], bx::mul(dir, app->gridStep));
-	app->meshes[app->selected].destroy();
-	app->meshes[app->selected] = buildMeshFromBrush(app->brushes[app->selected], app->layout);
+	translateBrush(app->brushes[bi], delta);
+	app->meshes[bi].destroy();
+	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
+}
+
+// Apply a message received from the server to the local map.
+void applyNetMessage(App* app, const uint8_t* data, size_t len) {
+	ByteReader r(data, len);
+	switch ((MsgType)r.u8()) {
+		case MsgType::Snapshot: {
+			const uint32_t n = r.u32();
+			app->brushes.clear();
+			for (uint32_t i = 0; i < n && r.ok; ++i) app->brushes.push_back(readBrush(r));
+			app->selectedId = 0;
+			app->selectedFace = -1;
+			rebuildSceneMeshes(app);
+			break;
+		}
+		case MsgType::CreateBrush: {
+			Brush b = readBrush(r);
+			if (!r.ok) break;
+			app->brushes.push_back(b);
+			app->meshes.push_back(buildMeshFromBrush(b, app->layout));
+			if (app->selectOnNextCreate) {
+				app->selectedId = b.id;
+				app->selectedFace = -1;
+				app->selectOnNextCreate = false;
+			}
+			break;
+		}
+		case MsgType::DeleteBrush: {
+			const uint32_t id = r.u32();
+			const int bi = indexOfId(app->brushes, id);
+			if (bi >= 0) {
+				app->meshes[bi].destroy();
+				app->meshes.erase(app->meshes.begin() + bi);
+				app->brushes.erase(app->brushes.begin() + bi);
+			}
+			if (app->selectedId == id) { app->selectedId = 0; app->selectedFace = -1; }
+			break;
+		}
+		case MsgType::TranslateBrush: {
+			const uint32_t id = r.u32();
+			const bx::Vec3 d = r.vec3();
+			const int bi = indexOfId(app->brushes, id);
+			if (r.ok && bi >= 0) {
+				translateBrush(app->brushes[bi], d);
+				app->meshes[bi].destroy();
+				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
+			}
+			break;
+		}
+		case MsgType::SetPlaneD: {
+			const uint32_t id = r.u32();
+			const uint32_t f = r.u32();
+			const float d = r.f32();
+			const int bi = indexOfId(app->brushes, id);
+			if (r.ok && bi >= 0 && f < app->brushes[bi].planes.size()) {
+				app->brushes[bi].planes[f].d = d;
+				app->meshes[bi].destroy();
+				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
+			}
+			break;
+		}
+	}
+}
+
+void netPoll(App* app) {
+	if (!app->net) return;
+	std::vector<NetEvent> evs;
+	netService(app->net, evs);
+	for (const NetEvent& e : evs) {
+		if (e.type == NetEvent::Connected) { app->online = true; SDL_Log("connected to server"); }
+		else if (e.type == NetEvent::Disconnected) { app->online = false; SDL_Log("disconnected from server"); }
+		else if (e.type == NetEvent::Data) applyNetMessage(app, e.data.data(), e.data.size());
+	}
 }
 
 void updateTargeted(App* app) {
@@ -282,9 +402,10 @@ void updateTargeted(App* app) {
 }
 
 void buildInitialScene(App* app) {
-	app->brushes.push_back(makeBox({0, 0, -8}, {512, 512, 8}, 0.45f, 0.47f, 0.50f));
-	app->brushes.push_back(makeBox({0, 0, 32}, {32, 32, 32}, 0.80f, 0.30f, 0.25f));
-	app->brushes.push_back(makeBox({128, 0, 24}, {24, 48, 24}, 0.30f, 0.65f, 0.35f));
+	auto add = [&](Brush b) { b.id = app->localNextId++; app->brushes.push_back(std::move(b)); };
+	add(makeBox({0, 0, -8}, {512, 512, 8}, 0.45f, 0.47f, 0.50f));
+	add(makeBox({0, 0, 32}, {32, 32, 32}, 0.80f, 0.30f, 0.25f));
+	add(makeBox({128, 0, 24}, {24, 48, 24}, 0.30f, 0.65f, 0.35f));
 	rebuildSceneMeshes(app);
 }
 
@@ -319,13 +440,17 @@ bool fillPlatformData(SDL_Window* window, bgfx::PlatformData& pd) {
 
 }  // namespace
 
-SDL_AppResult SDL_AppInit(void** appstate, int, char**) {
+SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 	if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) return SDL_APP_FAILURE;
 
 	App* app = new App();
 	*appstate = app;
 
-	app->window = SDL_CreateWindow("cooped — milestone 3", (int)app->width, (int)app->height,
+	// Optional: `cooped <serverHost> [port]` connects to a dedicated server (native only).
+	const char* serverHost = (argc > 1) ? argv[1] : nullptr;
+	const uint16_t serverPort = (argc > 2) ? (uint16_t)atoi(argv[2]) : 27500;
+
+	app->window = SDL_CreateWindow("cooped — milestone 5", (int)app->width, (int)app->height,
 	                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
 	if (!app->window) return SDL_APP_FAILURE;
 
@@ -354,8 +479,18 @@ SDL_AppResult SDL_AppInit(void** appstate, int, char**) {
 	app->program = createWorldProgram();
 	app->u_albedo = bgfx::createUniform("u_albedo", bgfx::UniformType::Vec4);
 
-	buildInitialScene(app);
+	buildInitialScene(app);  // local sandbox; replaced by the server snapshot if we connect
 	rebuildGrid(app);
+
+	if (serverHost) {
+		if (netGlobalInit()) {
+			app->net = netConnect(serverHost, serverPort);
+			SDL_Log(app->net ? "connecting to %s:%u ..." : "netConnect to %s:%u failed",
+			        serverHost, serverPort);
+		} else {
+			SDL_Log("net init failed");
+		}
+	}
 
 	SDL_SetWindowRelativeMouseMode(app->window, true);
 	app->lastTicksNs = SDL_GetTicksNS();
@@ -377,7 +512,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 			break;
 		case SDL_EVENT_MOUSE_BUTTON_DOWN:
 			if (app->editMode && event->button.button == SDL_BUTTON_LEFT) {
-				app->selected = app->targeted;          // brush under crosshair (or -1 = deselect)
+				app->selectedId = (app->targeted >= 0) ? app->brushes[app->targeted].id : 0;
 				app->selectedFace = app->targetedFace;  // the face becomes the push/pull target
 				resetPushPull(app);
 			}
@@ -398,7 +533,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 				case SDLK_ESCAPE: return SDL_APP_SUCCESS;
 				case SDLK_E:
 					app->editMode = !app->editMode;
-					app->selected = -1;
+					app->selectedId = 0;
 					app->selectedFace = -1;
 					if (!app->editMode) {  // entering play: drop the body in at the fly-cam eye
 						app->playerPos = bx::sub(app->cam.pos, bx::Vec3(0, 0, kEyeOffset));
@@ -441,6 +576,8 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 
 SDL_AppResult SDL_AppIterate(void* appstate) {
 	App* app = static_cast<App*>(appstate);
+
+	netPoll(app);  // apply any snapshot/edit ops from the server
 
 	const uint64_t now = SDL_GetTicksNS();
 	float dt = float(double(now - app->lastTicksNs) / 1.0e9);
@@ -510,13 +647,14 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	bgfx::setViewTransform(0, view, proj);
 	bgfx::touch(0);
 
+	const int selIdx = indexOfId(app->brushes, app->selectedId);
 	const uint64_t triState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z |
 	                          BGFX_STATE_DEPTH_TEST_LESS;
 	for (int i = 0; i < (int)app->meshes.size(); ++i) {
 		const Mesh& m = app->meshes[i];
 		if (!bgfx::isValid(m.vbh)) continue;
 		float col[4] = {m.color[0], m.color[1], m.color[2], 1.0f};
-		if (app->editMode && i == app->selected) {        // selected: warm highlight
+		if (app->editMode && i == selIdx) {                // selected: warm highlight
 			col[0] = 1.0f; col[1] = 0.75f; col[2] = 0.2f;
 		} else if (app->editMode && i == app->targeted) {  // targeted: brighten
 			col[0] = bx::min(col[0] * 1.6f, 1.0f);
@@ -531,8 +669,8 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	}
 
 	// Highlight a face: the selected one (the push/pull target) if any, else the targeted one.
-	const bool haveSel = app->selected >= 0 && app->selectedFace >= 0;
-	const int hiBrush = haveSel ? app->selected : app->targeted;
+	const bool haveSel = selIdx >= 0 && app->selectedFace >= 0;
+	const int hiBrush = haveSel ? selIdx : app->targeted;
 	const int hiFace = haveSel ? app->selectedFace : app->targetedFace;
 	if (app->editMode && hiBrush >= 0 && hiFace >= 0 && hiBrush < (int)app->brushes.size()) {
 		std::vector<BrushVertex> tris;
@@ -565,8 +703,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	if (app->editMode) {
 		const uint16_t cols = uint16_t(app->width / 8), rows = uint16_t(app->height / 16);
 		bgfx::dbgTextPrintf(cols / 2, rows / 2, 0x0f, "+");  // crosshair
-		bgfx::dbgTextPrintf(1, 1, 0x0e, "EDIT  grid:%d  brushes:%zu  sel:%d face:%d",
-		                    (int)app->gridStep, app->brushes.size(), app->selected, app->selectedFace);
+		bgfx::dbgTextPrintf(1, 1, 0x0e, "EDIT [%s]  grid:%d  brushes:%zu  sel:%u face:%d",
+		                    app->net ? (app->online ? "online" : "connecting") : "local",
+		                    (int)app->gridStep, app->brushes.size(), app->selectedId, app->selectedFace);
 		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
 		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  [ ]:grid  Ctrl+Z/Y:undo/redo  E:play");
 	} else {
@@ -588,6 +727,7 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		if (bgfx::isValid(app->program)) bgfx::destroy(app->program);
 		bgfx::shutdown();
 	}
+	if (app->net) netDisconnect(app->net);
 	if (app->window) SDL_DestroyWindow(app->window);
 	delete app;
 	SDL_Quit();

@@ -49,6 +49,18 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(SDL3 bgfx)
 
+# ENet — native UDP transport for the client and the dedicated server. Browsers can't do raw
+# UDP, so the web build skips it (net.cpp stubs out) until the WebRTC transport (Milestone 7).
+if(NOT EMSCRIPTEN)
+  FetchContent_Declare(
+    enet
+    GIT_REPOSITORY https://github.com/lsalzman/enet.git
+    GIT_TAG        v1.3.18
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(enet)
+endif()
+
 # ---------------------------------------------------------------------------
 # Shaders → embedded headers (compiled natively, committed, reused by the web build)
 # ---------------------------------------------------------------------------
@@ -87,11 +99,23 @@ add_executable(cooped
   src/main.cpp
   src/brush.cpp
   src/physics.cpp
+  src/net.cpp
 )
 target_include_directories(cooped PRIVATE src)
 # Ensure the embedded shader headers are (re)generated before main.cpp compiles (native only).
 if(NOT EMSCRIPTEN)
   add_dependencies(cooped cooped_shaders)
+  target_link_libraries(cooped PRIVATE enet)
+  target_include_directories(cooped PRIVATE ${enet_SOURCE_DIR}/include)  # enet doesn't export it
+endif()
+
+# ---------------------------------------------------------------------------
+# Dedicated server (native only): authoritative map + edit-op relay. No renderer.
+# ---------------------------------------------------------------------------
+if(NOT EMSCRIPTEN)
+  add_executable(cooped_server src/server_main.cpp src/brush.cpp)
+  target_include_directories(cooped_server PRIVATE src ${enet_SOURCE_DIR}/include)
+  target_link_libraries(cooped_server PRIVATE bx enet)
 endif()
 
 # SDL3 exposes SDL3::SDL3-static when built static; SDL3::SDL3 otherwise.

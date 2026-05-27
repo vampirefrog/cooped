@@ -23,6 +23,7 @@ struct BrushVertex {
 };
 
 struct Brush {
+	uint32_t id = 0;  // stable, server-assigned identifier (0 = unassigned)
 	std::vector<Plane> planes;
 	float color[3] = {0.8f, 0.8f, 0.8f};
 };
