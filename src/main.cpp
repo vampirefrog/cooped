@@ -706,14 +706,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	for (int i = 0; i < (int)app->meshes.size(); ++i) {
 		const Mesh& m = app->meshes[i];
 		if (!bgfx::isValid(m.vbh)) continue;
-		float col[4] = {m.color[0], m.color[1], m.color[2], 1.0f};
-		if (app->editMode && i == selIdx) {                // selected: warm highlight
-			col[0] = 1.0f; col[1] = 0.75f; col[2] = 0.2f;
-		} else if (app->editMode && i == app->targeted) {  // targeted: brighten
-			col[0] = bx::min(col[0] * 1.6f, 1.0f);
-			col[1] = bx::min(col[1] * 1.6f, 1.0f);
-			col[2] = bx::min(col[2] * 1.6f, 1.0f);
-		}
+		// Brushes always render with their own color; selection/targeting is shown by the
+		// face outline below (no whole-brush recolor — easier on the eyes).
+		const float col[4] = {m.color[0], m.color[1], m.color[2], 1.0f};
 		bgfx::setVertexBuffer(0, m.vbh);
 		bgfx::setIndexBuffer(m.ibh);
 		bgfx::setUniform(app->u_albedo, col);
@@ -738,24 +733,40 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		}
 	}
 
-	// Highlight a face: the selected one (the push/pull target) if any, else the targeted one.
+	// Outline a face (selected = bright, else targeted = subtle) — the polygon edges as lines,
+	// lifted slightly off the surface. Easier on the eyes than recoloring the whole face.
 	const bool haveSel = selIdx >= 0 && app->selectedFace >= 0;
 	const int hiBrush = haveSel ? selIdx : app->targeted;
 	const int hiFace = haveSel ? app->selectedFace : app->targetedFace;
 	if (app->editMode && hiBrush >= 0 && hiFace >= 0 && hiBrush < (int)app->brushes.size()) {
-		std::vector<BrushVertex> tris;
-		buildFaceMesh(app->brushes[hiBrush], (size_t)hiFace, 0.4f, tris);
-		const uint32_t n = (uint32_t)tris.size();
-		if (n > 0 && bgfx::getAvailTransientVertexBuffer(n, app->layout) >= n) {
-			bgfx::TransientVertexBuffer tvb;
-			bgfx::allocTransientVertexBuffer(&tvb, n, app->layout);
-			memcpy(tvb.data, tris.data(), n * sizeof(BrushVertex));
-			const float sel[4] = {1.0f, 0.95f, 0.3f, 1.0f};   // selected: bright
-			const float tgt[4] = {0.55f, 0.6f, 0.75f, 1.0f};  // targeted: subtle
-			bgfx::setVertexBuffer(0, &tvb);
-			bgfx::setUniform(app->u_albedo, haveSel ? sel : tgt);
-			bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_DEPTH_TEST_LEQUAL);
-			bgfx::submit(0, app->program);
+		const std::vector<bx::Vec3> poly = brushFacePolygon(app->brushes[hiBrush], (size_t)hiFace);
+		if (poly.size() >= 3) {
+			const bx::Vec3 n = app->brushes[hiBrush].planes[hiFace].n;
+			const bx::Vec3 off = bx::mul(n, 0.4f);  // lift the line off the surface
+			// Use the light direction as the line's normal so it shades to full brightness
+			// regardless of which way the face points (outline reads crisply).
+			const bx::Vec3 ln = bx::normalize(bx::Vec3(0.35f, 0.25f, 0.9f));
+			std::vector<BrushVertex> lines;
+			lines.reserve(poly.size() * 2);
+			for (size_t i = 0; i < poly.size(); ++i) {  // edge i -> i+1, as a line-list pair
+				const bx::Vec3 a = bx::add(poly[i], off);
+				const bx::Vec3 b = bx::add(poly[(i + 1) % poly.size()], off);
+				lines.push_back({a.x, a.y, a.z, ln.x, ln.y, ln.z});
+				lines.push_back({b.x, b.y, b.z, ln.x, ln.y, ln.z});
+			}
+			const uint32_t cnt = (uint32_t)lines.size();
+			if (bgfx::getAvailTransientVertexBuffer(cnt, app->layout) >= cnt) {
+				bgfx::TransientVertexBuffer tvb;
+				bgfx::allocTransientVertexBuffer(&tvb, cnt, app->layout);
+				memcpy(tvb.data, lines.data(), cnt * sizeof(BrushVertex));
+				const float sel[4] = {1.0f, 0.95f, 0.3f, 1.0f};  // selected: bright yellow
+				const float tgt[4] = {0.7f, 0.85f, 1.0f, 1.0f};  // targeted: pale blue
+				bgfx::setVertexBuffer(0, &tvb);
+				bgfx::setUniform(app->u_albedo, haveSel ? sel : tgt);
+				bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
+				               BGFX_STATE_DEPTH_TEST_LEQUAL | BGFX_STATE_PT_LINES);
+				bgfx::submit(0, app->program);
+			}
 		}
 	}
 
