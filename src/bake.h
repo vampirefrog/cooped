@@ -16,6 +16,8 @@ struct BakeResult {
 	uint32_t vertexCount = 0;      // number of world-soup vertices (== brushes built in order)
 };
 
-// Unwrap the world (xatlas) and bake shadowed direct light (Embree) into a lightmap,
-// returning the RGBA8 texels + per-vertex lightmap UVs for the renderer to sample.
-BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights);
+// Unwrap the world (xatlas) and bake shadowed direct light + a radiosity bounce (Embree) into a
+// lightmap, returning the RGBM RGBA8 texels + per-vertex lightmap UVs for the renderer to sample.
+// texelsPerUnit sets the atlas density (higher = sharper, but bake cost grows ~quadratically).
+BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights,
+                         float texelsPerUnit = 1.0f / 32.0f);

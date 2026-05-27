@@ -246,6 +246,7 @@ struct App {
 	int  targetedFace = -1;      // face of that brush under the crosshair
 	uint32_t ppId = 0; int ppFace = -1;  // active push/pull face, for undo coalescing
 	float gridStep = 64.0f;
+	float lightmapTexelsPerUnit = 1.0f / 32.0f;  // bake density (H + wheel); 1/this = units per texel
 
 	float mouseDx = 0.0f, mouseDy = 0.0f;
 	uint64_t lastTicksNs = 0;
@@ -1000,6 +1001,10 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 					if (event->wheel.y > 0) app->gridStep = bx::min(app->gridStep * 2.0f, 512.0f);
 					else if (event->wheel.y < 0) app->gridStep = bx::max(app->gridStep * 0.5f, 8.0f);
 					rebuildGrid(app);
+				} else if (SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_H]) {  // H + wheel: lightmap density
+					// Up = finer (more texels/unit). Capped at 1/16 to keep the O(n^2) bake bounded.
+					if (event->wheel.y > 0) app->lightmapTexelsPerUnit = bx::min(app->lightmapTexelsPerUnit * 2.0f, 1.0f / 16.0f);
+					else if (event->wheel.y < 0) app->lightmapTexelsPerUnit = bx::max(app->lightmapTexelsPerUnit * 0.5f, 1.0f / 128.0f);
 				} else {  // wheel: push/pull the selected face (up = push out, down = pull in)
 					if (event->wheel.y > 0) pushPullFace(app, -1);
 					else if (event->wheel.y < 0) pushPullFace(app, +1);
@@ -1037,7 +1042,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 						case SDLK_T: cycleTexture(app); break;
 #if !defined(__EMSCRIPTEN__)
 						case SDLK_F6: {  // GI bake: unwrap + shadowed direct light, then display it
-							const BakeResult br = bakeLightmaps(app->brushes, app->lights);
+							const BakeResult br = bakeLightmaps(app->brushes, app->lights, app->lightmapTexelsPerUnit);
 							if (br.ok && !br.pixels.empty()) {
 								applyLightmapTexture(app, br.atlasWidth, br.atlasHeight, br.pixels, br.vertexUV);
 								if (app->online) {  // persist + share: server stores and ships it to everyone
@@ -1303,11 +1308,12 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	if (app->editMode) {
 		const uint16_t cols = uint16_t(app->width / 8), rows = uint16_t(app->height / 16);
 		bgfx::dbgTextPrintf(cols / 2, rows / 2, 0x0f, "+");  // crosshair
-		bgfx::dbgTextPrintf(1, 1, 0x0e, "EDIT [%s]  grid:%d  brushes:%zu  sel:%u face:%d",
+		bgfx::dbgTextPrintf(1, 1, 0x0e, "EDIT [%s]  grid:%d  lmap:%du/tx  brushes:%zu  sel:%u face:%d",
 		                    app->net ? (app->online ? "online" : "connecting") : "local",
-		                    (int)app->gridStep, app->brushes.size(), app->selectedId, app->selectedFace);
+		                    (int)app->gridStep, (int)(1.0f / app->lightmapTexelsPerUnit),
+		                    app->brushes.size(), app->selectedId, app->selectedFace);
 		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
-		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  G+wheel:grid  T:texture  Ctrl+Z/Y:undo  E:play");
+		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  G+wheel:grid  H+wheel:lmap  T:texture  F6:bake  Ctrl+Z/Y:undo  E:play");
 		bgfx::dbgTextPrintf(1, 4, 0x09, "face UV:  [ ]:scale  , .:rotate  shift+arrows:offset  \\:reset");
 		bgfx::dbgTextPrintf(1, 6, 0x0d, "lights:  L:place  drag a cube face to move  K:delete  C:color (%d)  |  count:%zu",
 		                    app->placeColorIdx, app->lights.size());

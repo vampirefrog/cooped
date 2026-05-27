@@ -27,7 +27,8 @@ inline uint8_t to8(float v) { return (uint8_t)(bx::clamp(v, 0.0f, 1.0f) * 255.0f
 // decodes it. Keeps the lightmap portable to WebGL2 while preserving bright bounced light.
 static const float kRgbmRange = 8.0f;
 
-BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights) {
+BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights,
+                         float texelsPerUnit) {
 	// --- gather the world triangle soup (positions + per-vertex face normals) ---
 	std::vector<float> positions, normals, albedos;  // albedos: per-vertex brush color, for color bleed
 	std::vector<uint32_t> indices;
@@ -58,7 +59,7 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 	decl.indexFormat = xatlas::IndexFormat::UInt32;
 	if (xatlas::AddMesh(atlas, decl) != xatlas::AddMeshError::Success) { xatlas::Destroy(atlas); return r; }
 	xatlas::PackOptions packOpts;
-	packOpts.texelsPerUnit = 1.0f / 32.0f;  // coarse for now
+	packOpts.texelsPerUnit = texelsPerUnit;  // density setting (units/texel = 1/this)
 	xatlas::Generate(atlas, xatlas::ChartOptions(), packOpts);
 	const uint32_t W = atlas->width, H = atlas->height;
 	if (W == 0 || H == 0 || atlas->meshCount == 0) { xatlas::Destroy(atlas); return r; }
