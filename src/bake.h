@@ -11,8 +11,11 @@ struct BakeResult {
 	uint32_t atlasWidth = 0;
 	uint32_t atlasHeight = 0;
 	uint32_t chartCount = 0;
+	std::vector<uint8_t> pixels;   // RGBA8 lightmap (tonemapped), atlasWidth*atlasHeight*4
+	std::vector<float> vertexUV;   // normalized lightmap UV, 2 per world-soup vertex
+	uint32_t vertexCount = 0;      // number of world-soup vertices (== brushes built in order)
 };
 
-// Unwrap the world (xatlas) and bake shadowed direct light (Embree) into a lightmap;
-// writes the result to /tmp/cooped_lightmap.ppm for now (runtime sampling comes next).
+// Unwrap the world (xatlas) and bake shadowed direct light (Embree) into a lightmap,
+// returning the RGBA8 texels + per-vertex lightmap UVs for the renderer to sample.
 BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights);

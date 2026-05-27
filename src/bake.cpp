@@ -63,6 +63,15 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 	if (W == 0 || H == 0 || atlas->meshCount == 0) { xatlas::Destroy(atlas); return r; }
 	const xatlas::Mesh& m = atlas->meshes[0];
 
+	// Per-soup-vertex normalized lightmap UV (last writer wins across chart-duplicated verts).
+	r.vertexCount = (uint32_t)(positions.size() / 3);
+	r.vertexUV.assign(r.vertexCount * 2, 0.0f);
+	for (uint32_t i = 0; i < m.vertexCount; ++i) {
+		const xatlas::Vertex& v = m.vertexArray[i];
+		r.vertexUV[v.xref * 2 + 0] = v.uv[0] / (float)W;
+		r.vertexUV[v.xref * 2 + 1] = v.uv[1] / (float)H;
+	}
+
 	// --- Embree BVH over the soup (for shadow rays) ---
 	RTCDevice dev = rtcNewDevice(nullptr);
 	RTCScene scene = rtcNewScene(dev);
@@ -160,15 +169,13 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 		covered.swap(cov2);
 	}
 
-	// Dump tonemapped lightmap to PPM for verification (runtime sampling comes next).
-	FILE* f = fopen("/tmp/cooped_lightmap.ppm", "wb");
-	if (f) {
-		fprintf(f, "P6\n%u %u\n255\n", W, H);
-		for (uint32_t i = 0; i < W * H; ++i) {
-			const uint8_t rgb[3] = {tonemap(lm[i * 3]), tonemap(lm[i * 3 + 1]), tonemap(lm[i * 3 + 2])};
-			fwrite(rgb, 1, 3, f);
-		}
-		fclose(f);
+	// Tonemap to an RGBA8 lightmap texture the renderer samples.
+	r.pixels.resize(W * H * 4);
+	for (uint32_t i = 0; i < W * H; ++i) {
+		r.pixels[i * 4 + 0] = tonemap(lm[i * 3 + 0]);
+		r.pixels[i * 4 + 1] = tonemap(lm[i * 3 + 1]);
+		r.pixels[i * 4 + 2] = tonemap(lm[i * 3 + 2]);
+		r.pixels[i * 4 + 3] = 255;
 	}
 
 	rtcReleaseScene(scene);
@@ -177,8 +184,7 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 	r.atlasWidth = W;
 	r.atlasHeight = H;
 	r.chartCount = atlas->chartCount;
-	printf("[bake] %u charts, lightmap %u x %u, %zu lights -> /tmp/cooped_lightmap.ppm\n",
-	       atlas->chartCount, W, H, lights.size());
+	printf("[bake] %u charts, lightmap %u x %u, %zu lights\n", atlas->chartCount, W, H, lights.size());
 	xatlas::Destroy(atlas);
 	return r;
 }

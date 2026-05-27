@@ -26,6 +26,7 @@ struct BrushVertex {
 	float x, y, z;     // position
 	float nx, ny, nz;  // normal
 	float u, v;        // texture coords (planar-projected per face)
+	float lu, lv;      // lightmap coords (filled by the bake; 0 until then)
 };
 
 struct Brush {

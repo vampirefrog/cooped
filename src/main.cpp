@@ -198,6 +198,10 @@ struct App {
 	bgfx::UniformHandle u_lightPosRadius = BGFX_INVALID_HANDLE;  // [kMaxLights] xyz+radius
 	bgfx::UniformHandle u_lightColor = BGFX_INVALID_HANDLE;      // [kMaxLights] rgb+intensity
 	std::vector<Light> lights;
+	// Baked lightmap (from F6). When present, brushes sample it instead of dynamic lighting.
+	bgfx::TextureHandle lightmapTex = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle s_lightmap = BGFX_INVALID_HANDLE;
+	bool hasLightmap = false;
 	bgfx::VertexBufferHandle lightWire = BGFX_INVALID_HANDLE;   // unit wireframe cube (line list)
 	uint32_t lightWireVerts = 0;
 	int placeColorIdx = 0;                                      // current light color to place
@@ -292,6 +296,37 @@ void rebuildSceneMeshes(App* app) {
 	app->meshes.clear();
 	app->meshes.reserve(app->brushes.size());
 	for (const Brush& b : app->brushes) app->meshes.push_back(buildMeshFromBrush(b, app->layout));
+	app->hasLightmap = false;  // meshes rebuilt without lightmap UVs -> bake is stale
+}
+
+// Rebuild all brush meshes with lightmap UVs from a bake (soup-vertex order matches the bake).
+void rebuildSceneMeshesLightmap(App* app, const std::vector<float>& vertexUV) {
+	for (Mesh& m : app->meshes) m.destroy();
+	app->meshes.clear();
+	app->meshes.reserve(app->brushes.size());
+	uint32_t soupBase = 0;
+	for (const Brush& b : app->brushes) {
+		std::vector<BrushVertex> verts;
+		std::vector<uint16_t> indices;
+		std::vector<FaceRange> faces;
+		buildBrushMesh(b, verts, indices, faces);
+		for (uint32_t k = 0; k < verts.size(); ++k) {
+			const uint32_t s = soupBase + k;
+			if (s * 2 + 1 < vertexUV.size()) { verts[k].lu = vertexUV[s * 2]; verts[k].lv = vertexUV[s * 2 + 1]; }
+		}
+		soupBase += (uint32_t)verts.size();
+		Mesh m;
+		if (!verts.empty() && !indices.empty()) {
+			m.vbh = bgfx::createVertexBuffer(
+			    bgfx::copy(verts.data(), uint32_t(verts.size() * sizeof(BrushVertex))), app->layout);
+			m.ibh = bgfx::createIndexBuffer(
+			    bgfx::copy(indices.data(), uint32_t(indices.size() * sizeof(uint16_t))));
+			m.numIndices = uint32_t(indices.size());
+			m.faces = std::move(faces);
+		}
+		m.color[0] = b.color[0]; m.color[1] = b.color[1]; m.color[2] = b.color[2];
+		app->meshes.push_back(std::move(m));
+	}
 }
 
 void rebuildGrid(App* app) {
@@ -372,7 +407,7 @@ void pushPullFace(App* app, int dir) {
 	}
 	app->brushes[bi].planes[fi].d = newD;
 	app->meshes[bi].destroy();
-	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);  // may be empty if collapsed
+	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout); app->hasLightmap = false;  // may be empty if collapsed
 }
 
 // Where the crosshair ray meets the z=0 plane (for brush placement).
@@ -434,7 +469,7 @@ void nudgeSelected(App* app, const bx::Vec3& dir) {
 	resetPushPull(app);
 	translateBrush(app->brushes[bi], delta);
 	app->meshes[bi].destroy();
-	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
+	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout); app->hasLightmap = false;
 }
 
 // Cycle the SELECTED FACE to the next texture (synced when online).
@@ -477,7 +512,7 @@ void setFaceUV(App* app, float us, float vs, float uo, float vo, float rot) {
 	Plane& pl = app->brushes[bi].planes[app->selectedFace];
 	pl.uScale = us; pl.vScale = vs; pl.uOffset = uo; pl.vOffset = vo; pl.rotation = rot;
 	app->meshes[bi].destroy();
-	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);  // UVs are baked in
+	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout); app->hasLightmap = false;  // UVs are baked in
 }
 
 // Place a point light above the crosshair's ground point (synced when online).
@@ -563,7 +598,7 @@ void endLightDrag(App* app) {
 // Light uniforms: real lighting for brushes, flat (ambient=1) for unlit overlays/markers.
 void setBrushLighting(App* app) {
 	const int n = (int)app->lights.size() > kMaxLights ? kMaxLights : (int)app->lights.size();
-	const float lp[4] = {(float)n, 0.15f, 0.0f, 0.0f};
+	const float lp[4] = {(float)n, 0.15f, app->hasLightmap ? 1.0f : 0.0f, 0.0f};  // z = use lightmap
 	const bx::Vec3 sd = bx::normalize(bx::Vec3(0.35f, 0.25f, 0.9f));
 	const float sun[4] = {sd.x, sd.y, sd.z, 0.6f};
 	bgfx::setUniform(app->u_lightParams, lp);
@@ -627,6 +662,7 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			if (!r.ok) break;
 			app->brushes.push_back(b);
 			app->meshes.push_back(buildMeshFromBrush(b, app->layout));
+			app->hasLightmap = false;  // new geometry without lightmap UVs
 			if (app->selectOnNextCreate) {
 				app->selectedId = b.id;
 				app->selectedFace = -1;
@@ -652,7 +688,7 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			if (r.ok && bi >= 0) {
 				translateBrush(app->brushes[bi], d);
 				app->meshes[bi].destroy();
-				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
+				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout); app->hasLightmap = false;
 			}
 			break;
 		}
@@ -664,7 +700,7 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			if (r.ok && bi >= 0 && f < app->brushes[bi].planes.size()) {
 				app->brushes[bi].planes[f].d = d;
 				app->meshes[bi].destroy();
-				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
+				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout); app->hasLightmap = false;
 			}
 			break;
 		}
@@ -705,7 +741,7 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 				Plane& pl = app->brushes[bi].planes[face];
 				pl.uScale = us; pl.vScale = vs; pl.uOffset = uo; pl.vOffset = vo; pl.rotation = rot;
 				app->meshes[bi].destroy();
-				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
+				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout); app->hasLightmap = false;
 			}
 			break;
 		}
@@ -834,10 +870,12 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 	    .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
 	    .add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float)
 	    .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
+	    .add(bgfx::Attrib::TexCoord1, 2, bgfx::AttribType::Float)
 	    .end();
 	app->program = createWorldProgram();
 	app->u_albedo = bgfx::createUniform("u_albedo", bgfx::UniformType::Vec4);
 	app->s_tex = bgfx::createUniform("s_tex", bgfx::UniformType::Sampler);
+	app->s_lightmap = bgfx::createUniform("s_lightmap", bgfx::UniformType::Sampler);
 	app->u_lightParams = bgfx::createUniform("u_lightParams", bgfx::UniformType::Vec4);
 	app->u_sunDir = bgfx::createUniform("u_sunDir", bgfx::UniformType::Vec4);
 	app->u_lightPosRadius = bgfx::createUniform("u_lightPosRadius", bgfx::UniformType::Vec4, kMaxLights);
@@ -980,10 +1018,19 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 						case SDLK_RETURN: createBrushAtAim(app); break;
 						case SDLK_T: cycleTexture(app); break;
 #if !defined(__EMSCRIPTEN__)
-						case SDLK_F6: {  // GI bake: unwrap + shadowed direct light -> /tmp lightmap
+						case SDLK_F6: {  // GI bake: unwrap + shadowed direct light, then display it
 							const BakeResult br = bakeLightmaps(app->brushes, app->lights);
-							SDL_Log("bake: ok=%d  atlas %ux%u  charts=%u", br.ok, br.atlasWidth,
-							        br.atlasHeight, br.chartCount);
+							if (br.ok && !br.pixels.empty()) {
+								if (bgfx::isValid(app->lightmapTex)) bgfx::destroy(app->lightmapTex);
+								app->lightmapTex = bgfx::createTexture2D(
+								    (uint16_t)br.atlasWidth, (uint16_t)br.atlasHeight, false, 1,
+								    bgfx::TextureFormat::RGBA8, BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+								    bgfx::copy(br.pixels.data(), (uint32_t)br.pixels.size()));
+								rebuildSceneMeshesLightmap(app, br.vertexUV);  // sets lightmap UVs on meshes
+								app->hasLightmap = true;
+							}
+							SDL_Log("bake: ok=%d atlas %ux%u charts=%u", br.ok, br.atlasWidth, br.atlasHeight,
+							        br.chartCount);
 							break;
 						}
 #endif
@@ -1131,6 +1178,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			const uint32_t tid = app->brushes[i].planes[fr.face].textureId;
 			const bgfx::TextureHandle tex = (tid < app->textures.size()) ? app->textures[tid] : app->whiteTex;
 			bgfx::setTexture(0, app->s_tex, tex);
+			bgfx::setTexture(1, app->s_lightmap, app->hasLightmap ? app->lightmapTex : app->whiteTex);
 			bgfx::setVertexBuffer(0, m.vbh);
 			bgfx::setIndexBuffer(m.ibh, fr.firstIndex, fr.numIndices);
 			bgfx::setUniform(app->u_albedo, white);
@@ -1153,6 +1201,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			if (l.id == app->dragLightId || i == app->targetedLight) { col[0] = col[1] = col[2] = 1.0f; }
 			bgfx::setTransform(mtx);
 			bgfx::setTexture(0, app->s_tex, app->whiteTex);
+			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
 			bgfx::setVertexBuffer(0, app->lightWire);
 			bgfx::setUniform(app->u_albedo, col);
 			bgfx::setState(lineState);
@@ -1170,6 +1219,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			colorFromId(kv.first, col);
 			bgfx::setTransform(mtx);
 			bgfx::setTexture(0, app->s_tex, app->whiteTex);
+			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
 			bgfx::setVertexBuffer(0, app->avatarMesh.vbh);
 			bgfx::setIndexBuffer(app->avatarMesh.ibh);
 			bgfx::setUniform(app->u_albedo, col);
@@ -1207,6 +1257,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 				const float sel[4] = {1.0f, 0.95f, 0.3f, 1.0f};  // selected: bright yellow
 				const float tgt[4] = {0.7f, 0.85f, 1.0f, 1.0f};  // targeted: pale blue
 				bgfx::setTexture(0, app->s_tex, app->whiteTex);
+			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
 				bgfx::setVertexBuffer(0, &tvb);
 				bgfx::setUniform(app->u_albedo, haveSel ? sel : tgt);
 				bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
@@ -1219,6 +1270,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	if (app->editMode && bgfx::isValid(app->grid.vbh)) {
 		const float gridColor[4] = {0.30f, 0.34f, 0.40f, 1.0f};
 		bgfx::setTexture(0, app->s_tex, app->whiteTex);
+			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
 		bgfx::setVertexBuffer(0, app->grid.vbh);
 		bgfx::setIndexBuffer(app->grid.ibh);
 		bgfx::setUniform(app->u_albedo, gridColor);
@@ -1272,6 +1324,8 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		for (bgfx::UniformHandle u : {app->s_sky, app->u_skyParams})
 			if (bgfx::isValid(u)) bgfx::destroy(u);
 		if (bgfx::isValid(app->s_tex)) bgfx::destroy(app->s_tex);
+		if (bgfx::isValid(app->lightmapTex)) bgfx::destroy(app->lightmapTex);
+		if (bgfx::isValid(app->s_lightmap)) bgfx::destroy(app->s_lightmap);
 		if (bgfx::isValid(app->u_albedo)) bgfx::destroy(app->u_albedo);
 		if (bgfx::isValid(app->program)) bgfx::destroy(app->program);
 		bgfx::shutdown();
