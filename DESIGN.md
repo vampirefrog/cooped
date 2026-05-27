@@ -26,7 +26,7 @@ in a browser-capable engine."
 
 | Concern | Choice | Why |
 |---|---|---|
-| Language / core | **C++17** | enet, Recast, Embree, Jolt, bgfx are all C++. Native + wasm from one codebase. |
+| Language / core | **C++20** | enet, Recast, Embree, Jolt, bgfx are all C++ (bx/bgfx require C++20). Native + wasm from one codebase. |
 | Browser target | **Emscripten → WebAssembly** | Compile the same C++ to the web. Proven by Tesseract/Cube 2 web ports. |
 | Build targets | **client** (native + wasm), **server/coordinator**, **headless worker** | One codebase; headless worker drops renderer/input/audio (§13). |
 | Rendering abstraction | **bgfx** | One API over WebGL2/WebGPU, GL, Vulkan, D3D, Metal. Solves browser+desktop in one layer. Supports MRT for deferred shading. |
@@ -477,7 +477,7 @@ connects to **one external relay** that speaks every platform and exposes a sing
 
 ## 17. Locked decisions
 
-- **Language:** **C++** (C++17), one codebase to desktop + wasm via Emscripten. No Rust.
+- **Language:** **C++20** (required by bx/bgfx), one codebase to desktop + wasm via Emscripten. No Rust.
 - **Render backend:** bgfx (single layer over WebGL2/WebGPU/GL/Vulkan).
 - **Browser transport:** **WebRTC DataChannels** — unreliable channel for gameplay, reliable
   for edits. The **server speaks ENet *and* WebRTC in one process (no gateway)** via

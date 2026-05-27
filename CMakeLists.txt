@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(cooped CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)  # bx/bgfx headers require C++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -34,7 +34,13 @@ FetchContent_Declare(
 
 # bgfx (via the community CMake wrapper, which vendors bx/bimg/bgfx as submodules)
 set(BGFX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(BGFX_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)  # flip ON when we add shaderc (milestone 2)
+# shaderc is a host tool: build it for native compiles only. The web build can't run a wasm
+# shaderc, so it consumes the pre-generated, committed embedded shader headers instead.
+if(EMSCRIPTEN)
+  set(BGFX_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+else()
+  set(BGFX_BUILD_TOOLS ON  CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(
   bgfx
   GIT_REPOSITORY https://github.com/bkaradzic/bgfx.cmake.git
@@ -44,9 +50,48 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(SDL3 bgfx)
 
 # ---------------------------------------------------------------------------
+# Shaders → embedded headers (compiled natively, committed, reused by the web build)
+# ---------------------------------------------------------------------------
+set(GEN_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/generated)
+if(NOT EMSCRIPTEN)
+  include(${bgfx_SOURCE_DIR}/cmake/bgfxToolUtils.cmake)
+  set(SHADER_SRC_DIR ${CMAKE_SOURCE_DIR}/src/shaders)
+  # 120 -> _glsl (desktop GL), 300_es -> _essl (WebGL2), spirv -> _spv (Vulkan)
+  bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_SRC_DIR}/vs_world.sc
+    VARYING_DEF ${SHADER_SRC_DIR}/varying.def.sc
+    OUTPUT_DIR ${GEN_SHADER_DIR}
+    INCLUDE_DIRS ${bgfx_SOURCE_DIR}/bgfx/src
+    PROFILES 120 300_es spirv
+    AS_HEADERS
+    OUT_FILES_VAR VS_SHADER_HEADERS
+  )
+  bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_SRC_DIR}/fs_world.sc
+    VARYING_DEF ${SHADER_SRC_DIR}/varying.def.sc
+    OUTPUT_DIR ${GEN_SHADER_DIR}
+    INCLUDE_DIRS ${bgfx_SOURCE_DIR}/bgfx/src
+    PROFILES 120 300_es spirv
+    AS_HEADERS
+    OUT_FILES_VAR FS_SHADER_HEADERS
+  )
+  add_custom_target(cooped_shaders DEPENDS ${VS_SHADER_HEADERS} ${FS_SHADER_HEADERS})
+endif()
+
+# ---------------------------------------------------------------------------
 # The client executable
 # ---------------------------------------------------------------------------
-add_executable(cooped src/main.cpp)
+add_executable(cooped
+  src/main.cpp
+  src/brush.cpp
+)
+target_include_directories(cooped PRIVATE src)
+# Ensure the embedded shader headers are (re)generated before main.cpp compiles (native only).
+if(NOT EMSCRIPTEN)
+  add_dependencies(cooped cooped_shaders)
+endif()
 
 # SDL3 exposes SDL3::SDL3-static when built static; SDL3::SDL3 otherwise.
 if(TARGET SDL3::SDL3-static)
