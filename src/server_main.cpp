@@ -149,6 +149,13 @@ std::vector<uint8_t> applyOp(std::vector<Brush>& brushes, std::vector<Light>& li
 				if (lights[i].id == id) { lights.erase(lights.begin() + i); break; }
 			return msgDeleteLight(id);
 		}
+		case MsgType::SetLightPos: {
+			const uint32_t id = r.u32();
+			const bx::Vec3 pos = r.vec3();
+			if (!r.ok) return {};
+			for (Light& l : lights) if (l.id == id) { l.pos = pos; break; }
+			return msgSetLightPos(id, pos);
+		}
 		case MsgType::CreateBrush: {
 			Brush b = readBrush(r);
 			if (!r.ok) return {};

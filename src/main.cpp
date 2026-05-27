@@ -37,6 +37,7 @@ namespace {
 
 constexpr float kGridExtent = 2048.0f;  // half-size of the rendered grid
 constexpr int   kMaxLights  = 32;        // must match fs_world.sc
+constexpr float kLightHalf  = 16.0f;     // half-size of a light's editable wireframe cube
 const float kPlaceColors[5][3] = {
     {1.0f, 1.0f, 1.0f}, {1.0f, 0.4f, 0.3f}, {0.4f, 1.0f, 0.5f}, {0.5f, 0.6f, 1.0f}, {1.0f, 0.85f, 0.5f}};
 
@@ -146,8 +147,17 @@ struct App {
 	bgfx::UniformHandle u_lightPosRadius = BGFX_INVALID_HANDLE;  // [kMaxLights] xyz+radius
 	bgfx::UniformHandle u_lightColor = BGFX_INVALID_HANDLE;      // [kMaxLights] rgb+intensity
 	std::vector<Light> lights;
-	Mesh lightMarker;                                           // small cube drawn at each light
+	bgfx::VertexBufferHandle lightWire = BGFX_INVALID_HANDLE;   // unit wireframe cube (line list)
+	uint32_t lightWireVerts = 0;
 	int placeColorIdx = 0;                                      // current light color to place
+
+	// Light targeting + Sauerbraten-style drag.
+	int targetedLight = -1;                       // light whose cube the crosshair is on
+	bx::Vec3 targetedLightNormal = bx::Vec3(0, 0, 1);
+	uint32_t dragLightId = 0;                     // light being dragged (0 = none)
+	bx::Vec3 dragPlaneN = bx::Vec3(0, 0, 1);      // drag plane normal (clicked face)
+	bx::Vec3 dragPlanePoint = bx::Vec3(0, 0, 0);  // a fixed point on the drag plane
+	bx::Vec3 dragOffset = bx::Vec3(0, 0, 0);      // grab point minus light centre
 
 	std::vector<Brush> brushes;   // source of truth
 	std::vector<Mesh>  meshes;    // rebuilt from brushes when dirty
@@ -451,6 +461,54 @@ void deleteNearestLight(App* app) {
 	app->lights.erase(app->lights.begin() + best);
 }
 
+int lightIndexById(App* app, uint32_t id) {
+	for (int i = 0; i < (int)app->lights.size(); ++i)
+		if (app->lights[i].id == id) return i;
+	return -1;
+}
+
+// Intersect a ray with a plane (normal n through point p). false if behind / parallel.
+bool rayPlane(const bx::Vec3& ro, const bx::Vec3& rd, const bx::Vec3& n, const bx::Vec3& p,
+              bx::Vec3& out) {
+	const float denom = bx::dot(n, rd);
+	if (bx::abs(denom) < 1.0e-5f) return false;
+	const float t = bx::dot(n, bx::sub(p, ro)) / denom;
+	if (t <= 0.0f) return false;
+	out = bx::add(ro, bx::mul(rd, t));
+	return true;
+}
+
+// Sauerbraten-style: grab the targeted light's cube face and drag it within that face's plane.
+void startLightDrag(App* app) {
+	if (app->targetedLight < 0) return;
+	const Light& l = app->lights[app->targetedLight];
+	app->dragLightId = l.id;
+	app->dragPlaneN = app->targetedLightNormal;  // drag within the plane of the clicked face
+	app->dragPlanePoint = l.pos;
+	bx::Vec3 P(0, 0, 0);
+	app->dragOffset = rayPlane(app->cam.pos, app->cam.forward(), app->dragPlaneN, app->dragPlanePoint, P)
+	                      ? bx::sub(P, l.pos)
+	                      : bx::Vec3(0, 0, 0);
+}
+
+void updateLightDrag(App* app) {
+	if (app->dragLightId == 0) return;
+	const int bi = lightIndexById(app, app->dragLightId);
+	if (bi < 0) { app->dragLightId = 0; return; }
+	bx::Vec3 P(0, 0, 0);
+	if (!rayPlane(app->cam.pos, app->cam.forward(), app->dragPlaneN, app->dragPlanePoint, P)) return;
+	bx::Vec3 np = bx::sub(P, app->dragOffset);
+	const float g = app->gridStep;
+	app->lights[bi].pos = bx::Vec3(snapToGrid(np.x, g), snapToGrid(np.y, g), snapToGrid(np.z, g));
+}
+
+void endLightDrag(App* app) {
+	if (app->dragLightId == 0) return;
+	const int bi = lightIndexById(app, app->dragLightId);
+	if (bi >= 0 && app->online) sendMsg(app, msgSetLightPos(app->dragLightId, app->lights[bi].pos));
+	app->dragLightId = 0;
+}
+
 // Light uniforms: real lighting for brushes, flat (ambient=1) for unlit overlays/markers.
 void setBrushLighting(App* app) {
 	const int n = (int)app->lights.size() > kMaxLights ? kMaxLights : (int)app->lights.size();
@@ -503,6 +561,14 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			if (r.ok)
 				for (size_t i = 0; i < app->lights.size(); ++i)
 					if (app->lights[i].id == id) { app->lights.erase(app->lights.begin() + i); break; }
+			break;
+		}
+		case MsgType::SetLightPos: {
+			const uint32_t id = r.u32();
+			const bx::Vec3 pos = r.vec3();
+			const int bi = lightIndexById(app, id);
+			// Don't clobber the light we're actively dragging with our own echo.
+			if (r.ok && bi >= 0 && id != app->dragLightId) app->lights[bi].pos = pos;
 			break;
 		}
 		case MsgType::CreateBrush: {
@@ -611,18 +677,34 @@ void netPoll(App* app) {
 void updateTargeted(App* app) {
 	app->targeted = -1;
 	app->targetedFace = -1;
+	app->targetedLight = -1;
 	if (!app->editMode) return;
 	const bx::Vec3 ro = app->cam.pos;
 	const bx::Vec3 rd = app->cam.forward();
-	float best = 1.0e30f;
+
+	float bestBrush = 1.0e30f;
 	for (int i = 0; i < (int)app->brushes.size(); ++i) {
 		const RayHit h = rayBrushIntersect(ro, rd, app->brushes[i]);
-		if (h.hit && h.t < best) {
-			best = h.t;
+		if (h.hit && h.t < bestBrush) {
+			bestBrush = h.t;
 			app->targeted = i;
 			app->targetedFace = h.face;
 		}
 	}
+	// Light cubes: raycast a box centred on each light to pick a face to drag.
+	float bestLight = 1.0e30f;
+	for (int i = 0; i < (int)app->lights.size(); ++i) {
+		const Brush box = makeBox(app->lights[i].pos, {kLightHalf, kLightHalf, kLightHalf}, 1, 1, 1);
+		const RayHit h = rayBrushIntersect(ro, rd, box);
+		if (h.hit && h.t < bestLight && h.face >= 0) {
+			bestLight = h.t;
+			app->targetedLight = i;
+			app->targetedLightNormal = box.planes[h.face].n;
+		}
+	}
+	// Whichever is closer wins (so a click drags the light only if it's in front of the brush).
+	if (app->targetedLight >= 0 && bestLight < bestBrush) { app->targeted = -1; app->targetedFace = -1; }
+	else { app->targetedLight = -1; }
 }
 
 void buildInitialScene(App* app) {
@@ -708,7 +790,24 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 	app->u_sunDir = bgfx::createUniform("u_sunDir", bgfx::UniformType::Vec4);
 	app->u_lightPosRadius = bgfx::createUniform("u_lightPosRadius", bgfx::UniformType::Vec4, kMaxLights);
 	app->u_lightColor = bgfx::createUniform("u_lightColor", bgfx::UniformType::Vec4, kMaxLights);
-	app->lightMarker = buildMeshFromBrush(makeBox({0, 0, 0}, {8, 8, 8}, 1, 1, 1), app->layout);
+	// Wireframe cube (12 edges) drawn at each light, sized to the editable box.
+	{
+		std::vector<BrushVertex> wire;
+		auto corner = [](int i) {
+			return bx::Vec3((i & 1) ? kLightHalf : -kLightHalf, (i & 2) ? kLightHalf : -kLightHalf,
+			                (i & 4) ? kLightHalf : -kLightHalf);
+		};
+		for (int i = 0; i < 8; ++i)
+			for (int bit : {1, 2, 4})
+				if (!(i & bit)) {
+					const bx::Vec3 a = corner(i), b = corner(i | bit);
+					wire.push_back({a.x, a.y, a.z, 0, 0, 1, 0, 0});
+					wire.push_back({b.x, b.y, b.z, 0, 0, 1, 0, 0});
+				}
+		app->lightWire = bgfx::createVertexBuffer(
+		    bgfx::copy(wire.data(), uint32_t(wire.size() * sizeof(BrushVertex))), app->layout);
+		app->lightWireVerts = (uint32_t)wire.size();
+	}
 
 	const uint32_t whitePixel = 0xffffffff;
 	app->whiteTex = bgfx::createTexture2D(1, 1, false, 1, bgfx::TextureFormat::RGBA8, 0,
@@ -764,10 +863,17 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 			break;
 		case SDL_EVENT_MOUSE_BUTTON_DOWN:
 			if (app->editMode && event->button.button == SDL_BUTTON_LEFT) {
-				app->selectedId = (app->targeted >= 0) ? app->brushes[app->targeted].id : 0;
-				app->selectedFace = app->targetedFace;  // the face becomes the push/pull target
-				resetPushPull(app);
+				if (app->targetedLight >= 0) {
+					startLightDrag(app);  // grab a light cube face to drag it
+				} else {
+					app->selectedId = (app->targeted >= 0) ? app->brushes[app->targeted].id : 0;
+					app->selectedFace = app->targetedFace;  // the face becomes the push/pull target
+					resetPushPull(app);
+				}
 			}
+			break;
+		case SDL_EVENT_MOUSE_BUTTON_UP:
+			if (event->button.button == SDL_BUTTON_LEFT) endLightDrag(app);
 			break;
 		case SDL_EVENT_MOUSE_WHEEL:
 			if (app->editMode) {
@@ -914,6 +1020,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	}
 
 	updateTargeted(app);
+	updateLightDrag(app);  // if dragging a light, follow the crosshair within its plane
 
 	// Send my position/orientation to the server ~20 Hz so others can see me.
 	if (app->online && now - app->lastStateSendNs > 50000000ULL) {
@@ -952,18 +1059,21 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 
 	setFlatLighting(app);  // overlays/markers below render unlit (flat albedo)
 
-	// Light markers: a small emissive cube at each light, in its color.
-	if (app->editMode && bgfx::isValid(app->lightMarker.vbh)) {
-		for (const Light& l : app->lights) {
+	// Light markers: a wireframe cube at each light, in its color (white if targeted/dragged).
+	if (app->editMode && bgfx::isValid(app->lightWire)) {
+		const uint64_t lineState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z |
+		                           BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_PT_LINES;
+		for (int i = 0; i < (int)app->lights.size(); ++i) {
+			const Light& l = app->lights[i];
 			float mtx[16];
 			bx::mtxTranslate(mtx, l.pos.x, l.pos.y, l.pos.z);
-			const float col[4] = {l.color[0], l.color[1], l.color[2], 1.0f};
+			float col[4] = {l.color[0], l.color[1], l.color[2], 1.0f};
+			if (l.id == app->dragLightId || i == app->targetedLight) { col[0] = col[1] = col[2] = 1.0f; }
 			bgfx::setTransform(mtx);
 			bgfx::setTexture(0, app->s_tex, app->whiteTex);
-			bgfx::setVertexBuffer(0, app->lightMarker.vbh);
-			bgfx::setIndexBuffer(app->lightMarker.ibh);
+			bgfx::setVertexBuffer(0, app->lightWire);
 			bgfx::setUniform(app->u_albedo, col);
-			bgfx::setState(triState);
+			bgfx::setState(lineState);
 			bgfx::submit(0, app->program);
 		}
 	}
@@ -1047,7 +1157,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
 		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  G+wheel:grid  T:texture  Ctrl+Z/Y:undo  E:play");
 		bgfx::dbgTextPrintf(1, 4, 0x09, "face UV:  [ ]:scale  , .:rotate  shift+arrows:offset  \\:reset");
-		bgfx::dbgTextPrintf(1, 6, 0x0d, "lights:  L:place  K:delete nearest  C:color (%d)  |  count:%zu",
+		bgfx::dbgTextPrintf(1, 6, 0x0d, "lights:  L:place  drag a cube face to move  K:delete  C:color (%d)  |  count:%zu",
 		                    app->placeColorIdx, app->lights.size());
 	} else {
 		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   E:edit   esc:quit",
@@ -1068,7 +1178,7 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		for (Mesh& m : app->meshes) m.destroy();
 		app->grid.destroy();
 		app->avatarMesh.destroy();
-		app->lightMarker.destroy();
+		if (bgfx::isValid(app->lightWire)) bgfx::destroy(app->lightWire);
 		for (bgfx::UniformHandle u : {app->u_lightParams, app->u_sunDir, app->u_lightPosRadius, app->u_lightColor})
 			if (bgfx::isValid(u)) bgfx::destroy(u);
 		for (bgfx::TextureHandle t : app->textures)

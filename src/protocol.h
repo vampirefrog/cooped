@@ -12,7 +12,7 @@
 
 // Bump on any wire-format change. The server sends it in AssignId; the client compares and
 // surfaces a clear mismatch instead of silently rendering a garbled map.
-constexpr uint32_t kProtocolVersion = 4;
+constexpr uint32_t kProtocolVersion = 5;
 
 enum class MsgType : uint8_t {
 	Snapshot       = 1,  // server->client: full map
@@ -27,6 +27,7 @@ enum class MsgType : uint8_t {
 	SetFaceUV      = 10, // brush id + face index + uScale,vScale,uOffset,vOffset,rotation
 	CreateLight    = 11, // client: pos+color+radius (id=0); server: with assigned id
 	DeleteLight    = 12, // light id
+	SetLightPos    = 13, // light id + position
 };
 
 struct ByteWriter {
@@ -114,6 +115,14 @@ inline std::vector<uint8_t> msgDeleteLight(uint32_t id) {
 	ByteWriter w;
 	w.u8((uint8_t)MsgType::DeleteLight);
 	w.u32(id);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgSetLightPos(uint32_t id, const bx::Vec3& pos) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::SetLightPos);
+	w.u32(id);
+	w.vec3(pos);
 	return w.data;
 }
 
