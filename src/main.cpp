@@ -565,9 +565,15 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 			}
 			break;
 		case SDL_EVENT_MOUSE_WHEEL:
-			if (app->editMode) {  // wheel up = push out, wheel down = pull in
-				if (event->wheel.y > 0) pushPullFace(app, -1);
-				else if (event->wheel.y < 0) pushPullFace(app, +1);
+			if (app->editMode) {
+				if (SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_G]) {  // G + wheel: change grid size
+					if (event->wheel.y > 0) app->gridStep = bx::min(app->gridStep * 2.0f, 512.0f);
+					else if (event->wheel.y < 0) app->gridStep = bx::max(app->gridStep * 0.5f, 8.0f);
+					rebuildGrid(app);
+				} else {  // wheel: push/pull the selected face (up = push out, down = pull in)
+					if (event->wheel.y > 0) pushPullFace(app, -1);
+					else if (event->wheel.y < 0) pushPullFace(app, +1);
+				}
 			}
 			break;
 		case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -788,7 +794,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		                    app->net ? (app->online ? "online" : "connecting") : "local",
 		                    (int)app->gridStep, app->brushes.size(), app->selectedId, app->selectedFace);
 		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
-		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  [ ]:grid  Ctrl+Z/Y:undo/redo  E:play");
+		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  G+wheel:grid  Ctrl+Z/Y:undo/redo  E:play");
 	} else {
 		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   E:edit   esc:quit",
 		                    app->onGround ? "[grounded]" : "[airborne]");
