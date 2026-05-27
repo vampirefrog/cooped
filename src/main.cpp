@@ -1002,8 +1002,8 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 					else if (event->wheel.y < 0) app->gridStep = bx::max(app->gridStep * 0.5f, 8.0f);
 					rebuildGrid(app);
 				} else if (SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_H]) {  // H + wheel: lightmap density
-					// Up = finer (more texels/unit). Capped at 1/16 to keep the O(n^2) bake bounded.
-					if (event->wheel.y > 0) app->lightmapTexelsPerUnit = bx::min(app->lightmapTexelsPerUnit * 2.0f, 1.0f / 16.0f);
+					// Up = finer (more texels/unit). Capped at 1/8 now the bake is multithreaded.
+					if (event->wheel.y > 0) app->lightmapTexelsPerUnit = bx::min(app->lightmapTexelsPerUnit * 2.0f, 1.0f / 8.0f);
 					else if (event->wheel.y < 0) app->lightmapTexelsPerUnit = bx::max(app->lightmapTexelsPerUnit * 0.5f, 1.0f / 128.0f);
 				} else {  // wheel: push/pull the selected face (up = push out, down = pull in)
 					if (event->wheel.y > 0) pushPullFace(app, -1);

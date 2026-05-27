@@ -1,9 +1,12 @@
 #include "bake.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include <bx/math.h>
@@ -29,6 +32,7 @@ static const float kRgbmRange = 8.0f;
 
 BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights,
                          float texelsPerUnit) {
+	const auto tStart = std::chrono::steady_clock::now();
 	// --- gather the world triangle soup (positions + per-vertex face normals) ---
 	std::vector<float> positions, normals, albedos;  // albedos: per-vertex brush color, for color bleed
 	std::vector<uint32_t> indices;
@@ -182,12 +186,16 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 		std::vector<bx::Vec3> radiosity = direct;  // converges to direct + bounced light
 
 		const int bounces = 2;
-		for (int pass = 0; pass < bounces; ++pass) {
-			std::vector<bx::Vec3> gathered(patches.size(), bx::Vec3(0, 0, 0));
-			for (size_t i = 0; i < patches.size(); ++i) {
+		const size_t P = patches.size();
+		// A receiver patch's gather depends only on the previous round's radiosity, so each
+		// bounce round is an independent parallel-for over patches + a barrier (bulk-synchronous).
+		// This is exactly the unit of work a network bake node would own a contiguous slice of;
+		// here the thread pool is the local executor (rtcOccluded1 is safe to call concurrently).
+		auto gatherRange = [&](size_t lo, size_t hi, std::vector<bx::Vec3>* out) {
+			for (size_t i = lo; i < hi; ++i) {
 				const Patch& pi = patches[i];
 				bx::Vec3 sum(0, 0, 0);
-				for (size_t j = 0; j < patches.size(); ++j) {
+				for (size_t j = 0; j < P; ++j) {
 					if (j == i) continue;
 					const Patch& pj = patches[j];
 					const bx::Vec3 d = bx::sub(pj.pos, pi.pos);
@@ -206,10 +214,23 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 					if (occluded(o, dir, dist - 0.2f)) continue;
 					sum = bx::add(sum, bx::mul(radiosity[j], ff));
 				}
-				gathered[i] = bx::Vec3(sum.x * pi.alb.x, sum.y * pi.alb.y, sum.z * pi.alb.z);
+				(*out)[i] = bx::Vec3(sum.x * pi.alb.x, sum.y * pi.alb.y, sum.z * pi.alb.z);
 			}
-			for (size_t i = 0; i < patches.size(); ++i)
-				radiosity[i] = bx::add(direct[i], gathered[i]);
+		};
+		unsigned hw = bx::max(1u, std::thread::hardware_concurrency());
+		if (const char* e = getenv("COOPED_BAKE_THREADS")) { const int v = atoi(e); if (v > 0) hw = (unsigned)v; }
+		const unsigned nthreads = (P < 512) ? 1u : hw;  // tiny bakes aren't worth the thread overhead
+		for (int pass = 0; pass < bounces; ++pass) {
+			std::vector<bx::Vec3> gathered(P, bx::Vec3(0, 0, 0));
+			std::vector<std::thread> pool;
+			const size_t chunk = (P + nthreads - 1) / nthreads;
+			for (unsigned t = 0; t < nthreads; ++t) {
+				const size_t lo = (size_t)t * chunk, hi = bx::min(P, lo + chunk);
+				if (lo >= hi) break;
+				pool.emplace_back(gatherRange, lo, hi, &gathered);
+			}
+			for (std::thread& th : pool) th.join();
+			for (size_t i = 0; i < P; ++i) radiosity[i] = bx::add(direct[i], gathered[i]);
 		}
 		double bounced = 0.0;
 		for (size_t i = 0; i < patches.size(); ++i) {
@@ -217,8 +238,8 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 			bounced += bx::length(bx::sub(radiosity[i], direct[i]));
 			lm[o] = radiosity[i].x; lm[o + 1] = radiosity[i].y; lm[o + 2] = radiosity[i].z;
 		}
-		printf("[bake] radiosity: %zu patches, %d bounces, avg indirect %.3f\n",
-		       patches.size(), bounces, patches.empty() ? 0.0 : bounced / patches.size());
+		printf("[bake] radiosity: %zu patches, %d bounces, %u threads, avg indirect %.3f\n",
+		       patches.size(), bounces, nthreads, patches.empty() ? 0.0 : bounced / patches.size());
 	}
 
 	// Dilate covered texels into their neighbours a couple of times (reduces chart-edge seams).
@@ -260,7 +281,8 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 	r.atlasWidth = W;
 	r.atlasHeight = H;
 	r.chartCount = atlas->chartCount;
-	printf("[bake] %u charts, lightmap %u x %u, %zu lights\n", atlas->chartCount, W, H, lights.size());
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
+	printf("[bake] %u charts, lightmap %u x %u, %zu lights, %.0f ms\n", atlas->chartCount, W, H, lights.size(), ms);
 	xatlas::Destroy(atlas);
 	return r;
 }
