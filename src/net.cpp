@@ -64,13 +64,89 @@ void netDisconnect(NetClient* c) {
 
 bool netIsConnected(NetClient* c) { return c && c->connected; }
 
-#else  // Emscripten: no UDP yet (WebRTC transport lands in Milestone 7)
+#else  // Emscripten: WebRTC DataChannel via the browser's RTCPeerConnection + WebSocket signaling.
+
+#include <cstring>
+
+#include <emscripten.h>
+
+// JS glue. The server URL comes from the ?server= query param, defaulting to ws://<host>:27501.
+// Incoming datachannel messages are queued in Module.coopRx (array of Uint8Array); C drains them.
+EM_JS(void, coop_js_connect, (), {
+	Module.coopState = 1;  // 0=disconnected, 1=connecting, 2=connected
+	Module.coopRx = [];
+	var url = (new URLSearchParams(location.search)).get('server')
+	          || ('ws://' + (location.hostname || 'localhost') + ':27501');
+	var ws = new WebSocket(url);
+	var pc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
+	var dc = pc.createDataChannel('data', {ordered: true});
+	dc.binaryType = 'arraybuffer';
+	Module.coopWS = ws; Module.coopPC = pc; Module.coopDC = dc;
+
+	dc.onopen = function() { Module.coopState = 2; };
+	dc.onclose = function() { Module.coopState = 0; };
+	dc.onmessage = function(e) { Module.coopRx.push(new Uint8Array(e.data)); };
+	pc.onicecandidate = function(e) {
+		if (e.candidate && ws.readyState === 1)
+			ws.send('CAND\n' + (e.candidate.sdpMid || '0') + '\n' + e.candidate.candidate);
+	};
+	ws.onopen = function() {
+		pc.createOffer()
+		  .then(function(o) { return pc.setLocalDescription(o); })
+		  .then(function() { ws.send('offer\n' + pc.localDescription.sdp); });
+	};
+	ws.onmessage = function(ev) {
+		var s = ev.data, nl = s.indexOf('\n'), type = s.substring(0, nl), rest = s.substring(nl + 1);
+		if (type === 'answer') {
+			pc.setRemoteDescription({type: 'answer', sdp: rest});
+		} else if (type === 'CAND') {
+			var nl2 = rest.indexOf('\n');
+			pc.addIceCandidate({candidate: rest.substring(nl2 + 1), sdpMid: rest.substring(0, nl2)});
+		}
+	};
+	ws.onclose = function() { if (Module.coopState !== 2) Module.coopState = 0; };
+});
+EM_JS(int, coop_js_state, (), { return Module.coopState || 0; });
+EM_JS(int, coop_js_rxcount, (), { return Module.coopRx ? Module.coopRx.length : 0; });
+EM_JS(int, coop_js_rxsize, (), { return (Module.coopRx && Module.coopRx.length) ? Module.coopRx[0].length : 0; });
+EM_JS(void, coop_js_rxpop, (uint8_t* ptr), { HEAPU8.set(Module.coopRx.shift(), ptr); });
+EM_JS(void, coop_js_send, (const uint8_t* ptr, int len), {
+	if (Module.coopDC && Module.coopDC.readyState === 'open') Module.coopDC.send(HEAPU8.slice(ptr, ptr + len));
+});
+
+struct NetClient {
+	bool reportedConnected = false;
+	bool reportedDisconnected = false;
+};
 
 bool netGlobalInit() { return true; }
-NetClient* netConnect(const char*, uint16_t) { return nullptr; }
-void netService(NetClient*, std::vector<NetEvent>&) {}
-void netSend(NetClient*, const uint8_t*, size_t, bool) {}
-void netDisconnect(NetClient*) {}
-bool netIsConnected(NetClient*) { return false; }
+
+NetClient* netConnect(const char*, uint16_t) {  // URL resolved in JS (query param / default)
+	coop_js_connect();
+	return new NetClient();
+}
+
+void netService(NetClient* c, std::vector<NetEvent>& out) {
+	if (!c) return;
+	const int st = coop_js_state();
+	if (st == 2 && !c->reportedConnected) {
+		c->reportedConnected = true;
+		out.push_back({NetEvent::Connected, {}});
+	}
+	if (st == 0 && c->reportedConnected && !c->reportedDisconnected) {
+		c->reportedDisconnected = true;
+		out.push_back({NetEvent::Disconnected, {}});
+	}
+	while (coop_js_rxcount() > 0) {
+		const int n = coop_js_rxsize();
+		std::vector<uint8_t> buf(n > 0 ? n : 1);
+		coop_js_rxpop(buf.data());
+		if (n > 0) { buf.resize(n); out.push_back({NetEvent::Data, std::move(buf)}); }
+	}
+}
+
+void netSend(NetClient*, const uint8_t* data, size_t len, bool) { coop_js_send(data, (int)len); }
+void netDisconnect(NetClient* c) { delete c; }
+bool netIsConnected(NetClient* c) { return c && coop_js_state() == 2; }
 
 #endif

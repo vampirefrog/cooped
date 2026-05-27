@@ -482,6 +482,13 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 	buildInitialScene(app);  // local sandbox; replaced by the server snapshot if we connect
 	rebuildGrid(app);
 
+#if defined(__EMSCRIPTEN__)
+	(void)serverHost; (void)serverPort;
+	if (netGlobalInit()) {  // browser always tries to connect; URL comes from ?server= or default
+		app->net = netConnect(nullptr, 0);
+		SDL_Log("connecting to server via WebRTC ...");
+	}
+#else
 	if (serverHost) {
 		if (netGlobalInit()) {
 			app->net = netConnect(serverHost, serverPort);
@@ -491,6 +498,7 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 			SDL_Log("net init failed");
 		}
 	}
+#endif
 
 	SDL_SetWindowRelativeMouseMode(app->window, true);
 	app->lastTicksNs = SDL_GetTicksNS();

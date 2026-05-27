@@ -59,6 +59,18 @@ if(NOT EMSCRIPTEN)
     GIT_SHALLOW    TRUE
   )
   FetchContent_MakeAvailable(enet)
+
+  # libdatachannel: WebRTC DataChannels + WebSocket signaling, for browser clients (server side).
+  # Data channels only (no media); the server speaks ENet *and* WebRTC in one process (no gateway).
+  set(NO_MEDIA    ON CACHE BOOL "" FORCE)
+  set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+  set(NO_TESTS    ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    libdatachannel
+    GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
+    GIT_TAG        v0.24.3
+  )
+  FetchContent_MakeAvailable(libdatachannel)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -115,7 +127,7 @@ endif()
 if(NOT EMSCRIPTEN)
   add_executable(cooped_server src/server_main.cpp src/brush.cpp)
   target_include_directories(cooped_server PRIVATE src ${enet_SOURCE_DIR}/include)
-  target_link_libraries(cooped_server PRIVATE bx enet)
+  target_link_libraries(cooped_server PRIVATE bx enet LibDataChannel::LibDataChannel)
 endif()
 
 # SDL3 exposes SDL3::SDL3-static when built static; SDL3::SDL3 otherwise.
