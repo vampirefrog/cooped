@@ -381,6 +381,33 @@ void cycleTexture(App* app) {
 	app->brushes[bi].planes[app->selectedFace].textureId = next;  // bound at draw — no rebuild
 }
 
+// The currently selected face's plane, or null.
+Plane* selectedPlane(App* app) {
+	const int bi = indexOfId(app->brushes, app->selectedId);
+	if (bi < 0 || app->selectedFace < 0 || app->selectedFace >= (int)app->brushes[bi].planes.size())
+		return nullptr;
+	return &app->brushes[bi].planes[app->selectedFace];
+}
+
+// Set the selected face's UV alignment to absolute values (synced when online; rebuilds the mesh).
+void setFaceUV(App* app, float us, float vs, float uo, float vo, float rot) {
+	const int bi = indexOfId(app->brushes, app->selectedId);
+	if (bi < 0 || app->selectedFace < 0 || app->selectedFace >= (int)app->brushes[bi].planes.size())
+		return;
+	us = bx::clamp(us, 0.0625f, 64.0f);
+	vs = bx::clamp(vs, 0.0625f, 64.0f);
+	if (app->online) {
+		sendMsg(app, msgSetFaceUV(app->selectedId, (uint32_t)app->selectedFace, us, vs, uo, vo, rot));
+		return;
+	}
+	pushUndo(app);
+	resetPushPull(app);
+	Plane& pl = app->brushes[bi].planes[app->selectedFace];
+	pl.uScale = us; pl.vScale = vs; pl.uOffset = uo; pl.vOffset = vo; pl.rotation = rot;
+	app->meshes[bi].destroy();
+	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);  // UVs are baked in
+}
+
 // Apply a message received from the server to the local map.
 void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 	ByteReader r(data, len);
@@ -466,6 +493,19 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			const int bi = indexOfId(app->brushes, id);
 			if (r.ok && bi >= 0 && face < app->brushes[bi].planes.size())
 				app->brushes[bi].planes[face].textureId = tid;
+			break;
+		}
+		case MsgType::SetFaceUV: {
+			const uint32_t id = r.u32();
+			const uint32_t face = r.u32();
+			const float us = r.f32(), vs = r.f32(), uo = r.f32(), vo = r.f32(), rot = r.f32();
+			const int bi = indexOfId(app->brushes, id);
+			if (r.ok && bi >= 0 && face < app->brushes[bi].planes.size()) {
+				Plane& pl = app->brushes[bi].planes[face];
+				pl.uScale = us; pl.vScale = vs; pl.uOffset = uo; pl.vOffset = vo; pl.rotation = rot;
+				app->meshes[bi].destroy();
+				app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
+			}
 			break;
 		}
 		case MsgType::PlayerState:  // client->server only
@@ -675,26 +715,40 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 			if (app->editMode) {
 				if (ctrl && event->key.key == SDLK_Z) { shift ? redo(app) : undo(app); }
 				else if (ctrl && event->key.key == SDLK_Y) { redo(app); }
-				else switch (event->key.key) {
-					case SDLK_RETURN: createBrushAtAim(app); break;
-					case SDLK_T: cycleTexture(app); break;
-					case SDLK_DELETE:
-					case SDLK_X: deleteSelected(app); break;
-					case SDLK_RIGHT: nudgeSelected(app, {1, 0, 0}); break;
-					case SDLK_LEFT:  nudgeSelected(app, {-1, 0, 0}); break;
-					case SDLK_UP:    nudgeSelected(app, {0, 1, 0}); break;
-					case SDLK_DOWN:  nudgeSelected(app, {0, -1, 0}); break;
-					case SDLK_PAGEUP:   nudgeSelected(app, {0, 0, 1}); break;
-					case SDLK_PAGEDOWN: nudgeSelected(app, {0, 0, -1}); break;
-					case SDLK_LEFTBRACKET:
-						app->gridStep = bx::max(app->gridStep * 0.5f, 8.0f);
-						rebuildGrid(app);
-						break;
-					case SDLK_RIGHTBRACKET:
-						app->gridStep = bx::min(app->gridStep * 2.0f, 512.0f);
-						rebuildGrid(app);
-						break;
-					default: break;
+				else {
+					Plane* p = selectedPlane(app);  // for UV-align keys
+					switch (event->key.key) {
+						case SDLK_RETURN: createBrushAtAim(app); break;
+						case SDLK_T: cycleTexture(app); break;
+						case SDLK_DELETE:
+						case SDLK_X: deleteSelected(app); break;
+						// Arrows: Shift = UV offset on the selected face, else move the brush.
+						case SDLK_RIGHT:
+							if (shift && p) setFaceUV(app, p->uScale, p->vScale, p->uOffset + 0.125f, p->vOffset, p->rotation);
+							else nudgeSelected(app, {1, 0, 0});
+							break;
+						case SDLK_LEFT:
+							if (shift && p) setFaceUV(app, p->uScale, p->vScale, p->uOffset - 0.125f, p->vOffset, p->rotation);
+							else nudgeSelected(app, {-1, 0, 0});
+							break;
+						case SDLK_UP:
+							if (shift && p) setFaceUV(app, p->uScale, p->vScale, p->uOffset, p->vOffset + 0.125f, p->rotation);
+							else nudgeSelected(app, {0, 1, 0});
+							break;
+						case SDLK_DOWN:
+							if (shift && p) setFaceUV(app, p->uScale, p->vScale, p->uOffset, p->vOffset - 0.125f, p->rotation);
+							else nudgeSelected(app, {0, -1, 0});
+							break;
+						case SDLK_PAGEUP:   nudgeSelected(app, {0, 0, 1}); break;
+						case SDLK_PAGEDOWN: nudgeSelected(app, {0, 0, -1}); break;
+						// UV align on the selected face.
+						case SDLK_LEFTBRACKET:  if (p) setFaceUV(app, p->uScale * 0.5f, p->vScale * 0.5f, p->uOffset, p->vOffset, p->rotation); break;
+						case SDLK_RIGHTBRACKET: if (p) setFaceUV(app, p->uScale * 2.0f, p->vScale * 2.0f, p->uOffset, p->vOffset, p->rotation); break;
+						case SDLK_COMMA:  if (p) setFaceUV(app, p->uScale, p->vScale, p->uOffset, p->vOffset, p->rotation - 15.0f); break;
+						case SDLK_PERIOD: if (p) setFaceUV(app, p->uScale, p->vScale, p->uOffset, p->vOffset, p->rotation + 15.0f); break;
+						case SDLK_BACKSLASH: if (p) setFaceUV(app, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f); break;
+						default: break;
+					}
 				}
 			}
 			break;
@@ -881,6 +935,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		                    (int)app->gridStep, app->brushes.size(), app->selectedId, app->selectedFace);
 		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
 		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  G+wheel:grid  T:texture  Ctrl+Z/Y:undo  E:play");
+		bgfx::dbgTextPrintf(1, 4, 0x09, "face UV:  [ ]:scale  , .:rotate  shift+arrows:offset  \\:reset");
 	} else {
 		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   E:edit   esc:quit",
 		                    app->onGround ? "[grounded]" : "[airborne]");

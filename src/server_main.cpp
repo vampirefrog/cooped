@@ -166,6 +166,18 @@ std::vector<uint8_t> applyOp(std::vector<Brush>& brushes, const uint8_t* data, s
 				if (face < b->planes.size()) b->planes[face].textureId = texId;
 			return msgSetFaceTexture(id, face, texId);
 		}
+		case MsgType::SetFaceUV: {
+			const uint32_t id = r.u32();
+			const uint32_t face = r.u32();
+			const float us = r.f32(), vs = r.f32(), uo = r.f32(), vo = r.f32(), rot = r.f32();
+			if (!r.ok) return {};
+			if (Brush* b = findBrush(brushes, id))
+				if (face < b->planes.size()) {
+					Plane& pl = b->planes[face];
+					pl.uScale = us; pl.vScale = vs; pl.uOffset = uo; pl.vOffset = vo; pl.rotation = rot;
+				}
+			return msgSetFaceUV(id, face, us, vs, uo, vo, rot);
+		}
 		default:
 			return {};
 	}

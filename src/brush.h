@@ -13,6 +13,10 @@ struct Plane {
 	bx::Vec3 n;               // outward unit normal
 	float    d;               // plane: dot(n, p) == d  (interior is dot(n, p) <= d)
 	uint32_t textureId = 0;   // per-face texture index
+	// Per-face UV alignment (applied to the planar projection).
+	float uScale = 1.0f, vScale = 1.0f;   // larger = texture appears bigger (fewer repeats)
+	float uOffset = 0.0f, vOffset = 0.0f; // in tiles
+	float rotation = 0.0f;                // degrees
 
 	Plane() : n(0.0f, 0.0f, 0.0f), d(0.0f) {}
 	Plane(const bx::Vec3& _n, float _d) : n(_n), d(_d) {}

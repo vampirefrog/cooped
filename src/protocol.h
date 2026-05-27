@@ -12,7 +12,7 @@
 
 // Bump on any wire-format change. The server sends it in AssignId; the client compares and
 // surfaces a clear mismatch instead of silently rendering a garbled map.
-constexpr uint32_t kProtocolVersion = 2;
+constexpr uint32_t kProtocolVersion = 3;
 
 enum class MsgType : uint8_t {
 	Snapshot       = 1,  // server->client: full map
@@ -24,6 +24,7 @@ enum class MsgType : uint8_t {
 	PlayerState    = 7,  // client->server: my pos + yaw + pitch
 	PlayerStates   = 8,  // server->clients: [count]{id,pos,yaw,pitch} of everyone
 	SetFaceTexture = 9,  // brush id + face index + texture index
+	SetFaceUV      = 10, // brush id + face index + uScale,vScale,uOffset,vOffset,rotation
 };
 
 struct ByteWriter {
@@ -49,7 +50,10 @@ inline void writeBrush(ByteWriter& w, const Brush& b) {
 	w.u32(b.id);
 	w.f32(b.color[0]); w.f32(b.color[1]); w.f32(b.color[2]);
 	w.u32((uint32_t)b.planes.size());
-	for (const Plane& pl : b.planes) { w.vec3(pl.n); w.f32(pl.d); w.u32(pl.textureId); }
+	for (const Plane& pl : b.planes) {
+		w.vec3(pl.n); w.f32(pl.d); w.u32(pl.textureId);
+		w.f32(pl.uScale); w.f32(pl.vScale); w.f32(pl.uOffset); w.f32(pl.vOffset); w.f32(pl.rotation);
+	}
 }
 
 inline Brush readBrush(ByteReader& r) {
@@ -62,6 +66,9 @@ inline Brush readBrush(ByteReader& r) {
 		const float d = r.f32();
 		Plane pl(nrm, d);
 		pl.textureId = r.u32();
+		pl.uScale = r.f32(); pl.vScale = r.f32();
+		pl.uOffset = r.f32(); pl.vOffset = r.f32();
+		pl.rotation = r.f32();
 		b.planes.push_back(pl);
 	}
 	return b;
@@ -129,5 +136,15 @@ inline std::vector<uint8_t> msgSetFaceTexture(uint32_t id, uint32_t face, uint32
 	w.u32(id);
 	w.u32(face);
 	w.u32(textureId);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgSetFaceUV(uint32_t id, uint32_t face, float uScale, float vScale,
+                                         float uOffset, float vOffset, float rotation) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::SetFaceUV);
+	w.u32(id);
+	w.u32(face);
+	w.f32(uScale); w.f32(vScale); w.f32(uOffset); w.f32(vOffset); w.f32(rotation);
 	return w.data;
 }

@@ -132,16 +132,22 @@ void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
 		if (poly.size() < 3) continue;  // degenerate / clipped away
 		const uint32_t faceFirstIndex = (uint32_t)outIndices.size();
 
-		const bx::Vec3& nrm = brush.planes[i].n;
+		const Plane& pl = brush.planes[i];
+		const bx::Vec3& nrm = pl.n;
 		const uint16_t base = static_cast<uint16_t>(outVerts.size());
-		// Planar texture projection from the face's dominant axis (one tile per 64 units).
+		// Planar projection from the dominant axis (1 tile / 64 units), then per-face UV align.
 		const float ax = bx::abs(nrm.x), ay = bx::abs(nrm.y), az = bx::abs(nrm.z);
-		const float s = 1.0f / 64.0f;
+		const float rad = pl.rotation * (3.14159265f / 180.0f);
+		const float cr = bx::cos(rad), sr = bx::sin(rad);
 		for (const bx::Vec3& p : poly) {
-			float u, v;
-			if (az >= ax && az >= ay)      { u = p.x * s; v = p.y * s; }  // floors / ceilings
-			else if (ax >= ay)             { u = p.y * s; v = p.z * s; }  // ±X walls
-			else                           { u = p.x * s; v = p.z * s; }  // ±Y walls
+			float a, b;
+			if (az >= ax && az >= ay)      { a = p.x; b = p.y; }  // floors / ceilings
+			else if (ax >= ay)             { a = p.y; b = p.z; }  // ±X walls
+			else                           { a = p.x; b = p.z; }  // ±Y walls
+			const float bu = a / 64.0f, bv = b / 64.0f;
+			const float ru = bu * cr - bv * sr, rv = bu * sr + bv * cr;  // rotate
+			const float u = ru / pl.uScale + pl.uOffset;                 // scale + offset
+			const float v = rv / pl.vScale + pl.vOffset;
 			outVerts.push_back({p.x, p.y, p.z, nrm.x, nrm.y, nrm.z, u, v});
 		}
 		for (size_t k = 1; k + 1 < poly.size(); ++k) {  // triangle fan
