@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -84,8 +85,19 @@ struct InMsg {
 
 std::mutex g_mtx;
 std::vector<std::shared_ptr<RtcPeer>> g_peers;                   // keeps ws/pc alive
-std::vector<std::shared_ptr<rtc::DataChannel>> g_openChannels;   // for broadcast
+std::vector<std::shared_ptr<rtc::DataChannel>> g_openChannels;   // for broadcast (guarded by g_mtx)
 std::queue<InMsg> g_inbound;
+
+// Player presence (all touched on the main thread only — ENet handlers and drainRtc run there).
+struct PlayerInfo {
+	uint32_t id = 0;
+	bx::Vec3 pos = bx::Vec3(0, 0, 0);
+	float yaw = 0.0f, pitch = 0.0f;
+	bool hasState = false;
+};
+uint32_t g_nextPlayerId = 1;
+std::map<uint32_t, PlayerInfo> g_players;              // id -> latest state
+std::map<rtc::DataChannel*, uint32_t> g_chanId;        // WebRTC channel -> player id
 
 Brush* findBrush(std::vector<Brush>& brushes, uint32_t id) {
 	for (Brush& b : brushes) if (b.id == id) return &b;
@@ -148,6 +160,52 @@ std::vector<uint8_t> applyOp(std::vector<Brush>& brushes, const uint8_t* data, s
 		default:
 			return {};
 	}
+}
+
+void sendENet(ENetPeer* peer, const std::vector<uint8_t>& msg) {
+	enet_peer_send(peer, 0, enet_packet_create(msg.data(), msg.size(), ENET_PACKET_FLAG_RELIABLE));
+}
+
+// Dispatch a message from a client: player-state updates the presence map; everything else is
+// an edit op (applied + rebroadcast). `senderId` is the sender's assigned player id.
+void handleClientMessage(std::vector<Brush>& brushes, uint32_t senderId, const uint8_t* data,
+                         size_t len, ENetHost* host) {
+	if (len < 1) return;
+	if ((MsgType)data[0] == MsgType::PlayerState) {
+		ByteReader r(data, len);
+		r.u8();
+		const bx::Vec3 p = r.vec3();
+		const float yaw = r.f32(), pitch = r.f32();
+		if (!r.ok) return;
+		auto it = g_players.find(senderId);
+		if (it != g_players.end()) {
+			it->second.pos = p;
+			it->second.yaw = yaw;
+			it->second.pitch = pitch;
+			it->second.hasState = true;
+		}
+		return;
+	}
+	const std::vector<uint8_t> rb = applyOp(brushes, data, len);
+	if (!rb.empty()) { broadcastAll(host, rb); g_dirty = true; }
+}
+
+// Build the PlayerStates broadcast from everyone who has reported a position.
+std::vector<uint8_t> buildPlayerStates() {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::PlayerStates);
+	uint32_t count = 0;
+	for (const auto& kv : g_players) if (kv.second.hasState) ++count;
+	w.u32(count);
+	for (const auto& kv : g_players) {
+		const PlayerInfo& p = kv.second;
+		if (!p.hasState) continue;
+		w.u32(p.id);
+		w.vec3(p.pos);
+		w.f32(p.yaw);
+		w.f32(p.pitch);
+	}
+	return w.data;
 }
 
 // Parse a signaling line from a browser: "offer\n<sdp>" or "CAND\n<mid>\n<candidate>".
@@ -228,18 +286,27 @@ void drainRtc(std::vector<Brush>& brushes, ENetHost* host) {
 		InMsg m = std::move(local.front());
 		local.pop();
 		switch (m.kind) {
-			case InKind::Join:
-				printf("browser client joined (%zu brushes)\n", brushes.size());
+			case InKind::Join: {
+				const uint32_t pid = g_nextPlayerId++;
+				g_chanId[m.dc.get()] = pid;
+				g_players[pid] = PlayerInfo{pid};
+				printf("browser client joined as player %u (%zu brushes)\n", pid, brushes.size());
+				sendToChannel(m.dc, msgAssignId(pid));
 				sendToChannel(m.dc, msgSnapshot(brushes));
 				break;
+			}
 			case InKind::Data: {
-				const std::vector<uint8_t> rb = applyOp(brushes, m.bytes.data(), m.bytes.size());
-				if (!rb.empty()) { broadcastAll(host, rb); g_dirty = true; }
+				auto it = g_chanId.find(m.dc.get());
+				handleClientMessage(brushes, it != g_chanId.end() ? it->second : 0, m.bytes.data(),
+				                    m.bytes.size(), host);
 				break;
 			}
-			case InKind::Leave:
+			case InKind::Leave: {
+				auto it = g_chanId.find(m.dc.get());
+				if (it != g_chanId.end()) { g_players.erase(it->second); g_chanId.erase(it); }
 				printf("browser client left\n");
 				break;
+			}
 		}
 	}
 }
@@ -290,24 +357,28 @@ int main(int argc, char** argv) {
 	       wsCfg.enableTls ? "wss" : "ws", wsPort, brushes.size(), mapPath);
 
 	auto lastSave = std::chrono::steady_clock::now();
+	auto lastStateBroadcast = std::chrono::steady_clock::now();
 	while (g_running) {
 		ENetEvent ev;
 		while (enet_host_service(server, &ev, 10) > 0) {
 			switch (ev.type) {
 				case ENET_EVENT_TYPE_CONNECT: {
-					printf("native client connected\n");
-					const std::vector<uint8_t> snap = msgSnapshot(brushes);
-					ENetPacket* pkt = enet_packet_create(snap.data(), snap.size(), ENET_PACKET_FLAG_RELIABLE);
-					enet_peer_send(ev.peer, 0, pkt);
+					const uint32_t pid = g_nextPlayerId++;
+					ev.peer->data = (void*)(uintptr_t)pid;
+					g_players[pid] = PlayerInfo{pid};
+					printf("native client connected as player %u\n", pid);
+					sendENet(ev.peer, msgAssignId(pid));
+					sendENet(ev.peer, msgSnapshot(brushes));
 					break;
 				}
 				case ENET_EVENT_TYPE_RECEIVE: {
-					const std::vector<uint8_t> rb = applyOp(brushes, ev.packet->data, ev.packet->dataLength);
+					const uint32_t pid = (uint32_t)(uintptr_t)ev.peer->data;
+					handleClientMessage(brushes, pid, ev.packet->data, ev.packet->dataLength, server);
 					enet_packet_destroy(ev.packet);
-					if (!rb.empty()) { broadcastAll(server, rb); g_dirty = true; }
 					break;
 				}
 				case ENET_EVENT_TYPE_DISCONNECT:
+					g_players.erase((uint32_t)(uintptr_t)ev.peer->data);
 					printf("native client disconnected\n");
 					break;
 				default:
@@ -316,8 +387,14 @@ int main(int argc, char** argv) {
 		}
 		drainRtc(brushes, server);
 
-		// Autosave at most every 5s when the map has changed.
+		// Broadcast everyone's position ~20 Hz so clients can render each other.
 		const auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStateBroadcast).count() >= 50) {
+			if (!g_players.empty()) broadcastAll(server, buildPlayerStates());
+			lastStateBroadcast = now;
+		}
+
+		// Autosave at most every 5s when the map has changed.
 		if (g_dirty && std::chrono::duration_cast<std::chrono::seconds>(now - lastSave).count() >= 5) {
 			if (saveMap(mapPath, brushes)) { g_dirty = false; printf("autosaved '%s'\n", mapPath); }
 			lastSave = now;

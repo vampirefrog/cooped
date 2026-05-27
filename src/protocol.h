@@ -16,6 +16,9 @@ enum class MsgType : uint8_t {
 	DeleteBrush    = 3,  // id
 	TranslateBrush = 4,  // id + delta
 	SetPlaneD      = 5,  // id + faceIndex + new plane distance (push/pull result)
+	AssignId       = 6,  // server->client: your player id
+	PlayerState    = 7,  // client->server: my pos + yaw + pitch
+	PlayerStates   = 8,  // server->clients: [count]{id,pos,yaw,pitch} of everyone
 };
 
 struct ByteWriter {
@@ -93,5 +96,21 @@ inline std::vector<uint8_t> msgSetPlaneD(uint32_t id, uint32_t face, float d) {
 	w.u32(id);
 	w.u32(face);
 	w.f32(d);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgAssignId(uint32_t id) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::AssignId);
+	w.u32(id);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgPlayerState(const bx::Vec3& pos, float yaw, float pitch) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::PlayerState);
+	w.vec3(pos);
+	w.f32(yaw);
+	w.f32(pitch);
 	return w.data;
 }

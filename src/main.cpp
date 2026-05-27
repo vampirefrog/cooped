@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <vector>
 
 #include "brush.h"
@@ -60,6 +61,19 @@ bgfx::ProgramHandle createWorldProgram() {
 	return bgfx::createProgram(makeShader(vs, vsn), makeShader(fs, fsn), true);
 }
 
+// A distinct-ish color per player id.
+void colorFromId(uint32_t id, float out[4]) {
+	out[0] = 0.35f + 0.6f * ((id * 73 % 100) / 100.0f);
+	out[1] = 0.35f + 0.6f * ((id * 151 % 100) / 100.0f);
+	out[2] = 0.35f + 0.6f * ((id * 199 % 100) / 100.0f);
+	out[3] = 1.0f;
+}
+
+struct RemotePlayer {
+	bx::Vec3 pos = bx::Vec3(0, 0, 0);
+	float yaw = 0.0f, pitch = 0.0f;
+};
+
 struct Mesh {
 	bgfx::VertexBufferHandle vbh = BGFX_INVALID_HANDLE;
 	bgfx::IndexBufferHandle  ibh = BGFX_INVALID_HANDLE;
@@ -104,6 +118,12 @@ struct App {
 	bool online = false;
 	bool selectOnNextCreate = false;  // select the next CreateBrush echo as ours
 	uint32_t localNextId = 1;         // id source for single-player (offline) brushes
+
+	// Player presence.
+	uint32_t myPlayerId = 0;                          // assigned by the server
+	std::map<uint32_t, RemotePlayer> remotePlayers;   // other players, by id
+	Mesh avatarMesh;                                  // body-sized box for rendering them
+	uint64_t lastStateSendNs = 0;
 
 	Camera cam;
 	// Play-mode player body (collision/gravity); in edit mode cam.pos is a free-fly camera.
@@ -370,6 +390,22 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			}
 			break;
 		}
+		case MsgType::AssignId:
+			app->myPlayerId = r.u32();
+			break;
+		case MsgType::PlayerStates: {
+			const uint32_t n = r.u32();
+			app->remotePlayers.clear();
+			for (uint32_t i = 0; i < n && r.ok; ++i) {
+				const uint32_t id = r.u32();
+				const bx::Vec3 p = r.vec3();
+				const float yaw = r.f32(), pitch = r.f32();
+				if (id != app->myPlayerId) app->remotePlayers[id] = RemotePlayer{p, yaw, pitch};
+			}
+			break;
+		}
+		case MsgType::PlayerState:  // client->server only
+			break;
 	}
 }
 
@@ -478,6 +514,9 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 	    .end();
 	app->program = createWorldProgram();
 	app->u_albedo = bgfx::createUniform("u_albedo", bgfx::UniformType::Vec4);
+
+	// Avatar: a body-sized box centered at origin (translated per remote player when drawn).
+	app->avatarMesh = buildMeshFromBrush(makeBox({0, 0, 0}, kPlayerHalf, 0.8f, 0.8f, 0.8f), app->layout);
 
 	buildInitialScene(app);  // local sandbox; replaced by the server snapshot if we connect
 	rebuildGrid(app);
@@ -647,6 +686,12 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 
 	updateTargeted(app);
 
+	// Send my position/orientation to the server ~20 Hz so others can see me.
+	if (app->online && now - app->lastStateSendNs > 50000000ULL) {
+		app->lastStateSendNs = now;
+		sendMsg(app, msgPlayerState(app->cam.pos, app->cam.yaw, app->cam.pitch));
+	}
+
 	float view[16], proj[16];
 	bx::mtxLookAt(view, app->cam.pos, bx::add(app->cam.pos, fwd), worldUp);
 	bx::mtxProj(proj, 60.0f, float(app->width) / float(app->height), 1.0f, 12000.0f,
@@ -674,6 +719,23 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::setUniform(app->u_albedo, col);
 		bgfx::setState(triState);
 		bgfx::submit(0, app->program);
+	}
+
+	// Remote players: a body-sized box at each (eye pos minus eye offset = body centre).
+	if (bgfx::isValid(app->avatarMesh.vbh)) {
+		for (const auto& kv : app->remotePlayers) {
+			const RemotePlayer& rp = kv.second;
+			float mtx[16];
+			bx::mtxTranslate(mtx, rp.pos.x, rp.pos.y, rp.pos.z - kEyeOffset);
+			float col[4];
+			colorFromId(kv.first, col);
+			bgfx::setTransform(mtx);
+			bgfx::setVertexBuffer(0, app->avatarMesh.vbh);
+			bgfx::setIndexBuffer(app->avatarMesh.ibh);
+			bgfx::setUniform(app->u_albedo, col);
+			bgfx::setState(triState);
+			bgfx::submit(0, app->program);
+		}
 	}
 
 	// Highlight a face: the selected one (the push/pull target) if any, else the targeted one.
@@ -720,6 +782,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   E:edit   esc:quit",
 		                    app->onGround ? "[grounded]" : "[airborne]");
 	}
+	if (app->net)
+		bgfx::dbgTextPrintf(1, 0, 0x0b, "%s  players online: %zu",
+		                    app->online ? "online" : "connecting", app->remotePlayers.size() + 1);
 
 	bgfx::frame();
 	return SDL_APP_CONTINUE;
@@ -731,6 +796,7 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 	if (app->bgfxInitialized) {
 		for (Mesh& m : app->meshes) m.destroy();
 		app->grid.destroy();
+		app->avatarMesh.destroy();
 		if (bgfx::isValid(app->u_albedo)) bgfx::destroy(app->u_albedo);
 		if (bgfx::isValid(app->program)) bgfx::destroy(app->program);
 		bgfx::shutdown();
