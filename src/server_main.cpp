@@ -204,8 +204,12 @@ void drainRtc(std::vector<Brush>& brushes, ENetHost* host) {
 }  // namespace
 
 int main(int argc, char** argv) {
+	// Usage: cooped_server [port] [cert.pem key.pem]
+	// With a cert+key, signaling is wss:// (TLS) so an https page (e.g. GitHub Pages) can connect.
 	const uint16_t port = (argc > 1) ? (uint16_t)atoi(argv[1]) : kDefaultPort;
 	const uint16_t wsPort = port + 1;
+	const char* certPem = (argc > 3) ? argv[2] : nullptr;
+	const char* keyPem = (argc > 3) ? argv[3] : nullptr;
 
 	if (enet_initialize() != 0) { fprintf(stderr, "enet_initialize failed\n"); return 1; }
 	atexit(enet_deinitialize);
@@ -219,13 +223,18 @@ int main(int argc, char** argv) {
 	rtc::InitLogger(rtc::LogLevel::Warning);
 	rtc::WebSocketServerConfiguration wsCfg;
 	wsCfg.port = wsPort;
+	if (certPem && keyPem) {
+		wsCfg.enableTls = true;
+		wsCfg.certificatePemFile = certPem;
+		wsCfg.keyPemFile = keyPem;
+	}
 	rtc::WebSocketServer wsServer(wsCfg);
 	wsServer.onClient(onWebSocketClient);
 
 	std::vector<Brush> brushes;
 	buildScene(brushes);
-	printf("cooped server: ENet udp:%u, WebRTC signaling ws:%u  (%zu brushes)\n", port, wsPort,
-	       brushes.size());
+	printf("cooped server: ENet udp:%u, WebRTC signaling %s:%u  (%zu brushes)\n", port,
+	       wsCfg.enableTls ? "wss" : "ws", wsPort, brushes.size());
 
 	for (;;) {
 		ENetEvent ev;
