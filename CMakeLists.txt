@@ -80,6 +80,29 @@ if(NOT EMSCRIPTEN)
     GIT_SHALLOW    TRUE
   )
   FetchContent_MakeAvailable(xatlas)
+
+  # Embree: ray tracing for the lightmap bake (shadow rays / radiosity visibility). Native only.
+  # Configured lean: no ISPC, internal tasking (no TBB), triangles only, SSE2 — keeps the build sane.
+  set(EMBREE_ISPC_SUPPORT          OFF        CACHE BOOL   "" FORCE)
+  set(EMBREE_TASKING_SYSTEM        "INTERNAL" CACHE STRING "" FORCE)
+  set(EMBREE_TUTORIALS             OFF        CACHE BOOL   "" FORCE)
+  set(EMBREE_STATIC_LIB            ON         CACHE BOOL   "" FORCE)
+  set(EMBREE_MAX_ISA               "SSE2"     CACHE STRING "" FORCE)
+  set(EMBREE_GEOMETRY_QUAD         OFF        CACHE BOOL   "" FORCE)
+  set(EMBREE_GEOMETRY_CURVE        OFF        CACHE BOOL   "" FORCE)
+  set(EMBREE_GEOMETRY_GRID         OFF        CACHE BOOL   "" FORCE)
+  set(EMBREE_GEOMETRY_SUBDIVISION  OFF        CACHE BOOL   "" FORCE)
+  set(EMBREE_GEOMETRY_INSTANCE     OFF        CACHE BOOL   "" FORCE)
+  set(EMBREE_GEOMETRY_INSTANCE_ARRAY OFF      CACHE BOOL   "" FORCE)
+  set(EMBREE_GEOMETRY_USER         OFF        CACHE BOOL   "" FORCE)
+  set(EMBREE_GEOMETRY_POINT        OFF        CACHE BOOL   "" FORCE)
+  FetchContent_Declare(
+    embree
+    GIT_REPOSITORY https://github.com/RenderKit/embree.git
+    GIT_TAG        v4.4.1
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(embree)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -149,9 +172,10 @@ if(NOT EMSCRIPTEN)
   add_dependencies(cooped cooped_shaders)
   target_link_libraries(cooped PRIVATE enet)
   target_include_directories(cooped PRIVATE ${enet_SOURCE_DIR}/include)  # enet doesn't export it
-  # GI lightmap bake (native only): xatlas unwrap. (Embree + radiosity to follow.)
+  # GI lightmap bake (native only): xatlas unwrap + Embree ray tracing.
   target_sources(cooped PRIVATE src/bake.cpp ${xatlas_SOURCE_DIR}/source/xatlas/xatlas.cpp)
-  target_include_directories(cooped PRIVATE ${xatlas_SOURCE_DIR}/source/xatlas)
+  target_include_directories(cooped PRIVATE ${xatlas_SOURCE_DIR}/source/xatlas ${embree_SOURCE_DIR}/include)
+  target_link_libraries(cooped PRIVATE embree)
 endif()
 
 # ---------------------------------------------------------------------------

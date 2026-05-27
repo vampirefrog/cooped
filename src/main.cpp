@@ -980,8 +980,8 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 						case SDLK_RETURN: createBrushAtAim(app); break;
 						case SDLK_T: cycleTexture(app); break;
 #if !defined(__EMSCRIPTEN__)
-						case SDLK_F6: {  // GI bake: unwrap the world (lightmap fill to follow)
-							const BakeResult br = bakeLightmaps(app->brushes);
+						case SDLK_F6: {  // GI bake: unwrap + shadowed direct light -> /tmp lightmap
+							const BakeResult br = bakeLightmaps(app->brushes, app->lights);
 							SDL_Log("bake: ok=%d  atlas %ux%u  charts=%u", br.ok, br.atlasWidth,
 							        br.atlasHeight, br.chartCount);
 							break;

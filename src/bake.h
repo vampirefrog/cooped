@@ -13,5 +13,6 @@ struct BakeResult {
 	uint32_t chartCount = 0;
 };
 
-// Step 1: unwrap the world's brush faces into a lightmap atlas (UVs). Bake fills come next.
-BakeResult bakeLightmaps(const std::vector<Brush>& brushes);
+// Unwrap the world (xatlas) and bake shadowed direct light (Embree) into a lightmap;
+// writes the result to /tmp/cooped_lightmap.ppm for now (runtime sampling comes next).
+BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights);
