@@ -133,8 +133,15 @@ void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
 
 		const bx::Vec3& nrm = brush.planes[i].n;
 		const uint16_t base = static_cast<uint16_t>(outVerts.size());
+		// Planar texture projection from the face's dominant axis (one tile per 64 units).
+		const float ax = bx::abs(nrm.x), ay = bx::abs(nrm.y), az = bx::abs(nrm.z);
+		const float s = 1.0f / 64.0f;
 		for (const bx::Vec3& p : poly) {
-			outVerts.push_back({p.x, p.y, p.z, nrm.x, nrm.y, nrm.z});
+			float u, v;
+			if (az >= ax && az >= ay)      { u = p.x * s; v = p.y * s; }  // floors / ceilings
+			else if (ax >= ay)             { u = p.y * s; v = p.z * s; }  // ±X walls
+			else                           { u = p.x * s; v = p.z * s; }  // ±Y walls
+			outVerts.push_back({p.x, p.y, p.z, nrm.x, nrm.y, nrm.z, u, v});
 		}
 		for (size_t k = 1; k + 1 < poly.size(); ++k) {  // triangle fan
 			outIndices.push_back(base);

@@ -20,10 +20,12 @@ struct Plane {
 struct BrushVertex {
 	float x, y, z;     // position
 	float nx, ny, nz;  // normal
+	float u, v;        // texture coords (planar-projected per face)
 };
 
 struct Brush {
-	uint32_t id = 0;  // stable, server-assigned identifier (0 = unassigned)
+	uint32_t id = 0;         // stable, server-assigned identifier (0 = unassigned)
+	uint32_t textureId = 0;  // index into the loaded texture set
 	std::vector<Plane> planes;
 	float color[3] = {0.8f, 0.8f, 0.8f};
 };

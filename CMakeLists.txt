@@ -136,7 +136,7 @@ if(TARGET SDL3::SDL3-static)
 else()
   target_link_libraries(cooped PRIVATE SDL3::SDL3)
 endif()
-target_link_libraries(cooped PRIVATE bgfx bx bimg)
+target_link_libraries(cooped PRIVATE bgfx bx bimg bimg_decode)
 
 # ---------------------------------------------------------------------------
 # Emscripten (browser) target
@@ -150,5 +150,9 @@ if(EMSCRIPTEN)
     "-sFULL_ES3=1"
     "-sALLOW_MEMORY_GROWTH=1"
     "-sGL_ENABLE_GET_PROC_ADDRESS=1"
+    # Package the texture set into the virtual filesystem at /data (read at runtime).
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/brick.jpg@/data/brick.jpg"
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/floor.jpg@/data/floor.jpg"
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/tiles.jpg@/data/tiles.jpg"
   )
 endif()

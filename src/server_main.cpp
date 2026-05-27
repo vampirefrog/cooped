@@ -157,6 +157,13 @@ std::vector<uint8_t> applyOp(std::vector<Brush>& brushes, const uint8_t* data, s
 				if (face < b->planes.size()) b->planes[face].d = d;
 			return msgSetPlaneD(id, face, d);
 		}
+		case MsgType::SetBrushTexture: {
+			const uint32_t id = r.u32();
+			const uint32_t texId = r.u32();
+			if (!r.ok) return {};
+			if (Brush* b = findBrush(brushes, id)) b->textureId = texId;
+			return msgSetBrushTexture(id, texId);
+		}
 		default:
 			return {};
 	}

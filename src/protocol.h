@@ -19,6 +19,7 @@ enum class MsgType : uint8_t {
 	AssignId       = 6,  // server->client: your player id
 	PlayerState    = 7,  // client->server: my pos + yaw + pitch
 	PlayerStates   = 8,  // server->clients: [count]{id,pos,yaw,pitch} of everyone
+	SetBrushTexture = 9, // brush id + texture index
 };
 
 struct ByteWriter {
@@ -42,6 +43,7 @@ struct ByteReader {
 
 inline void writeBrush(ByteWriter& w, const Brush& b) {
 	w.u32(b.id);
+	w.u32(b.textureId);
 	w.f32(b.color[0]); w.f32(b.color[1]); w.f32(b.color[2]);
 	w.u32((uint32_t)b.planes.size());
 	for (const Plane& pl : b.planes) { w.vec3(pl.n); w.f32(pl.d); }
@@ -50,6 +52,7 @@ inline void writeBrush(ByteWriter& w, const Brush& b) {
 inline Brush readBrush(ByteReader& r) {
 	Brush b;
 	b.id = r.u32();
+	b.textureId = r.u32();
 	b.color[0] = r.f32(); b.color[1] = r.f32(); b.color[2] = r.f32();
 	const uint32_t n = r.u32();
 	for (uint32_t i = 0; i < n && r.ok; ++i) {
@@ -112,5 +115,13 @@ inline std::vector<uint8_t> msgPlayerState(const bx::Vec3& pos, float yaw, float
 	w.vec3(pos);
 	w.f32(yaw);
 	w.f32(pitch);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgSetBrushTexture(uint32_t id, uint32_t textureId) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::SetBrushTexture);
+	w.u32(id);
+	w.u32(textureId);
 	return w.data;
 }

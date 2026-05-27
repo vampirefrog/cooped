@@ -9,7 +9,11 @@
 
 #include <bgfx/bgfx.h>
 #include <bgfx/platform.h>
+#include <bimg/decode.h>
+#include <bx/allocator.h>
 #include <bx/math.h>
+
+#include <cstdio>
 
 #include <cstdint>
 #include <cstdlib>
@@ -45,6 +49,29 @@ constexpr float kFriction    = 12.0f;  // stop quickly when keys released (was 6
 
 bgfx::ShaderHandle makeShader(const uint8_t* data, uint32_t size) {
 	return bgfx::createShader(bgfx::copy(data, size));
+}
+
+// Load + decode an image file (jpg/png) into an RGBA8 texture. Invalid handle on failure.
+bgfx::TextureHandle loadTexture(const char* path) {
+	FILE* f = fopen(path, "rb");
+	if (!f) return BGFX_INVALID_HANDLE;
+	fseek(f, 0, SEEK_END);
+	const long size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	std::vector<uint8_t> buf(size > 0 ? (size_t)size : 0);
+	const size_t got = buf.empty() ? 0 : fread(buf.data(), 1, buf.size(), f);
+	fclose(f);
+	if (got != buf.size() || buf.empty()) return BGFX_INVALID_HANDLE;
+
+	static bx::DefaultAllocator alloc;
+	bimg::ImageContainer* img =
+	    bimg::imageParse(&alloc, buf.data(), (uint32_t)buf.size(), bimg::TextureFormat::RGBA8);
+	if (!img) return BGFX_INVALID_HANDLE;
+	bgfx::TextureHandle h = bgfx::createTexture2D(
+	    (uint16_t)img->m_width, (uint16_t)img->m_height, false, 1, bgfx::TextureFormat::RGBA8, 0,
+	    bgfx::copy(img->m_data, img->m_size));
+	bimg::imageFree(img);
+	return h;
 }
 
 bgfx::ProgramHandle createWorldProgram() {
@@ -106,6 +133,9 @@ struct App {
 	bgfx::VertexLayout layout;
 	bgfx::ProgramHandle program = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle u_albedo = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle s_tex = BGFX_INVALID_HANDLE;
+	std::vector<bgfx::TextureHandle> textures;            // loaded texture set
+	bgfx::TextureHandle whiteTex = BGFX_INVALID_HANDLE;   // 1x1 white (untextured draws)
 
 	std::vector<Brush> brushes;   // source of truth
 	std::vector<Mesh>  meshes;    // rebuilt from brushes when dirty
@@ -331,6 +361,20 @@ void nudgeSelected(App* app, const bx::Vec3& dir) {
 	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
 }
 
+// Cycle the selected brush to the next texture (id-based; synced when online).
+void cycleTexture(App* app) {
+	const int bi = indexOfId(app->brushes, app->selectedId);
+	if (bi < 0 || app->textures.empty()) return;
+	const uint32_t next = (app->brushes[bi].textureId + 1) % (uint32_t)app->textures.size();
+	if (app->online) {
+		sendMsg(app, msgSetBrushTexture(app->selectedId, next));
+		return;
+	}
+	pushUndo(app);
+	resetPushPull(app);
+	app->brushes[bi].textureId = next;  // no mesh rebuild — texture is bound at draw time
+}
+
 // Apply a message received from the server to the local map.
 void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 	ByteReader r(data, len);
@@ -402,6 +446,13 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 				const float yaw = r.f32(), pitch = r.f32();
 				if (id != app->myPlayerId) app->remotePlayers[id] = RemotePlayer{p, yaw, pitch};
 			}
+			break;
+		}
+		case MsgType::SetBrushTexture: {
+			const uint32_t id = r.u32();
+			const uint32_t tid = r.u32();
+			const int bi = indexOfId(app->brushes, id);
+			if (r.ok && bi >= 0) app->brushes[bi].textureId = tid;
 			break;
 		}
 		case MsgType::PlayerState:  // client->server only
@@ -511,9 +562,21 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 	app->layout.begin()
 	    .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
 	    .add(bgfx::Attrib::Normal, 3, bgfx::AttribType::Float)
+	    .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
 	    .end();
 	app->program = createWorldProgram();
 	app->u_albedo = bgfx::createUniform("u_albedo", bgfx::UniformType::Vec4);
+	app->s_tex = bgfx::createUniform("s_tex", bgfx::UniformType::Sampler);
+
+	const uint32_t whitePixel = 0xffffffff;
+	app->whiteTex = bgfx::createTexture2D(1, 1, false, 1, bgfx::TextureFormat::RGBA8, 0,
+	                                      bgfx::copy(&whitePixel, 4));
+	const char* texFiles[] = {"data/brick.jpg", "data/floor.jpg", "data/tiles.jpg"};
+	for (const char* tf : texFiles) {
+		bgfx::TextureHandle t = loadTexture(tf);
+		if (!bgfx::isValid(t)) { t = app->whiteTex; SDL_Log("texture load failed: %s", tf); }
+		app->textures.push_back(t);
+	}
 
 	// Avatar: a body-sized box centered at origin (translated per remote player when drawn).
 	app->avatarMesh = buildMeshFromBrush(makeBox({0, 0, 0}, kPlayerHalf, 0.8f, 0.8f, 0.8f), app->layout);
@@ -601,6 +664,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 				else if (ctrl && event->key.key == SDLK_Y) { redo(app); }
 				else switch (event->key.key) {
 					case SDLK_RETURN: createBrushAtAim(app); break;
+					case SDLK_T: cycleTexture(app); break;
 					case SDLK_DELETE:
 					case SDLK_X: deleteSelected(app); break;
 					case SDLK_RIGHT: nudgeSelected(app, {1, 0, 0}); break;
@@ -709,15 +773,17 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	const int selIdx = indexOfId(app->brushes, app->selectedId);
 	const uint64_t triState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z |
 	                          BGFX_STATE_DEPTH_TEST_LESS;
+	const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 	for (int i = 0; i < (int)app->meshes.size(); ++i) {
 		const Mesh& m = app->meshes[i];
 		if (!bgfx::isValid(m.vbh)) continue;
-		// Brushes always render with their own color; selection/targeting is shown by the
-		// face outline below (no whole-brush recolor — easier on the eyes).
-		const float col[4] = {m.color[0], m.color[1], m.color[2], 1.0f};
+		// Textured by the brush's textureId; selection/targeting shown by the face outline below.
+		const uint32_t tid = app->brushes[i].textureId;
+		const bgfx::TextureHandle tex = (tid < app->textures.size()) ? app->textures[tid] : app->whiteTex;
+		bgfx::setTexture(0, app->s_tex, tex);
 		bgfx::setVertexBuffer(0, m.vbh);
 		bgfx::setIndexBuffer(m.ibh);
-		bgfx::setUniform(app->u_albedo, col);
+		bgfx::setUniform(app->u_albedo, white);
 		bgfx::setState(triState);
 		bgfx::submit(0, app->program);
 	}
@@ -731,6 +797,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			float col[4];
 			colorFromId(kv.first, col);
 			bgfx::setTransform(mtx);
+			bgfx::setTexture(0, app->s_tex, app->whiteTex);
 			bgfx::setVertexBuffer(0, app->avatarMesh.vbh);
 			bgfx::setIndexBuffer(app->avatarMesh.ibh);
 			bgfx::setUniform(app->u_albedo, col);
@@ -767,6 +834,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 				memcpy(tvb.data, lines.data(), cnt * sizeof(BrushVertex));
 				const float sel[4] = {1.0f, 0.95f, 0.3f, 1.0f};  // selected: bright yellow
 				const float tgt[4] = {0.7f, 0.85f, 1.0f, 1.0f};  // targeted: pale blue
+				bgfx::setTexture(0, app->s_tex, app->whiteTex);
 				bgfx::setVertexBuffer(0, &tvb);
 				bgfx::setUniform(app->u_albedo, haveSel ? sel : tgt);
 				bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
@@ -778,6 +846,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 
 	if (app->editMode && bgfx::isValid(app->grid.vbh)) {
 		const float gridColor[4] = {0.30f, 0.34f, 0.40f, 1.0f};
+		bgfx::setTexture(0, app->s_tex, app->whiteTex);
 		bgfx::setVertexBuffer(0, app->grid.vbh);
 		bgfx::setIndexBuffer(app->grid.ibh);
 		bgfx::setUniform(app->u_albedo, gridColor);
@@ -794,7 +863,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		                    app->net ? (app->online ? "online" : "connecting") : "local",
 		                    (int)app->gridStep, app->brushes.size(), app->selectedId, app->selectedFace);
 		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
-		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  G+wheel:grid  Ctrl+Z/Y:undo/redo  E:play");
+		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  G+wheel:grid  T:texture  Ctrl+Z/Y:undo  E:play");
 	} else {
 		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   E:edit   esc:quit",
 		                    app->onGround ? "[grounded]" : "[airborne]");
@@ -814,6 +883,10 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		for (Mesh& m : app->meshes) m.destroy();
 		app->grid.destroy();
 		app->avatarMesh.destroy();
+		for (bgfx::TextureHandle t : app->textures)
+			if (bgfx::isValid(t) && t.idx != app->whiteTex.idx) bgfx::destroy(t);
+		if (bgfx::isValid(app->whiteTex)) bgfx::destroy(app->whiteTex);
+		if (bgfx::isValid(app->s_tex)) bgfx::destroy(app->s_tex);
 		if (bgfx::isValid(app->u_albedo)) bgfx::destroy(app->u_albedo);
 		if (bgfx::isValid(app->program)) bgfx::destroy(app->program);
 		bgfx::shutdown();
