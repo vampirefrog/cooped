@@ -19,8 +19,11 @@
 #include <enet/enet.h>
 #include <rtc/rtc.hpp>
 
+#include <cmath>
+
 #include "brush.h"
 #include "map_io.h"
+#include "navmesh.h"
 #include "protocol.h"
 
 namespace {
@@ -72,6 +75,21 @@ struct PlayerInfo {
 uint32_t g_nextPlayerId = 1;
 std::map<uint32_t, PlayerInfo> g_players;              // id -> latest state
 std::map<rtc::DataChannel*, uint32_t> g_chanId;        // WebRTC channel -> player id
+
+// --- server-driven AI agents that wander the Recast navmesh (broadcast like player presence) ---
+NavMesh g_nav;
+bool g_navDirty = false;          // geometry changed; rebuild the navmesh (throttled in the loop)
+uint32_t g_nextAgentId = 1;
+struct Agent {
+	uint32_t id = 0;
+	float pos[3] = {0, 0, 0};
+	float yaw = 0.0f;
+	std::vector<float> path;      // flattened xyz straight-path waypoints (cooped coords)
+	size_t wp = 0;                // index of the current target waypoint
+};
+std::vector<Agent> g_agents;
+constexpr float kAgentSpeed = 90.0f;    // world units / second
+constexpr float kWanderRadius = 450.0f; // how far an agent picks its next goal
 
 Brush* findBrush(std::vector<Brush>& brushes, uint32_t id) {
 	for (Brush& b : brushes) if (b.id == id) return &b;
@@ -216,6 +234,9 @@ void handleClientMessage(std::vector<Brush>& brushes, std::vector<Light>& lights
 		// Any geometry/light change makes the stored bake stale; texture swaps don't affect it.
 		const MsgType mt = (MsgType)data[0];
 		if (mt != MsgType::Lightmap && mt != MsgType::SetFaceTexture) g_lightmap = LightmapData{};
+		// Geometry edits also invalidate the navmesh (rebuilt, throttled, in the main loop).
+		if (mt == MsgType::CreateBrush || mt == MsgType::DeleteBrush ||
+		    mt == MsgType::TranslateBrush || mt == MsgType::SetPlaneD) g_navDirty = true;
 	}
 }
 
@@ -233,6 +254,58 @@ std::vector<uint8_t> buildPlayerStates() {
 		w.vec3(p.pos);
 		w.f32(p.yaw);
 		w.f32(p.pitch);
+	}
+	return w.data;
+}
+
+// Give an agent a fresh random goal and a navmesh path to it (waypoint 0 is its start).
+void agentPickGoal(Agent& a) {
+	a.path.clear();
+	a.wp = 0;
+	float goal[3];
+	if (!g_nav.randomPointAround(a.pos, kWanderRadius, goal)) return;
+	std::vector<float> pts;
+	if (g_nav.findPath(a.pos, goal, pts) && pts.size() >= 6) { a.path = std::move(pts); a.wp = 1; }
+}
+
+void spawnAgents(int n) {
+	g_agents.clear();
+	if (!g_nav.valid()) return;
+	const float center[3] = {0, 0, 0};
+	for (int i = 0; i < n; ++i) {
+		float p[3];
+		if (!g_nav.randomPointAround(center, 700.0f, p)) continue;
+		Agent a;
+		a.id = g_nextAgentId++;
+		a.pos[0] = p[0]; a.pos[1] = p[1]; a.pos[2] = p[2];
+		agentPickGoal(a);
+		g_agents.push_back(std::move(a));
+	}
+}
+
+// Advance each agent along its path; pick a new goal when it arrives or its path runs out.
+void stepAgents(float dt) {
+	for (Agent& a : g_agents) {
+		const size_t N = a.path.size() / 3;
+		if (N < 2 || a.wp >= N) { agentPickGoal(a); continue; }
+		const float* w = &a.path[a.wp * 3];
+		const float dx = w[0] - a.pos[0], dy = w[1] - a.pos[1], dz = w[2] - a.pos[2];
+		const float d = std::sqrt(dx * dx + dy * dy);
+		if (d > 1.0e-3f) a.yaw = std::atan2(dy, dx);
+		const float step = kAgentSpeed * dt;
+		if (d <= step) { a.pos[0] = w[0]; a.pos[1] = w[1]; a.pos[2] = w[2]; ++a.wp; }
+		else { a.pos[0] += dx / d * step; a.pos[1] += dy / d * step; a.pos[2] += dz * (step / d); }
+	}
+}
+
+std::vector<uint8_t> buildAgentStates() {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::AgentStates);
+	w.u32((uint32_t)g_agents.size());
+	for (const Agent& a : g_agents) {
+		w.u32(a.id);
+		w.f32(a.pos[0]); w.f32(a.pos[1]); w.f32(a.pos[2]);
+		w.f32(a.yaw);
 	}
 	return w.data;
 }
@@ -387,8 +460,12 @@ int main(int argc, char** argv) {
 	printf("cooped server: ENet udp:%u, WebRTC signaling %s:%u  (%zu brushes, map='%s')\n", port,
 	       wsCfg.enableTls ? "wss" : "ws", wsPort, brushes.size(), mapPath);
 
+	if (g_nav.build(brushes)) { spawnAgents(5); printf("navmesh built; %zu AI agents wandering\n", g_agents.size()); }
+	else printf("navmesh build failed (no walkable area?)\n");
+
 	auto lastSave = std::chrono::steady_clock::now();
 	auto lastStateBroadcast = std::chrono::steady_clock::now();
+	auto lastNavBuild = std::chrono::steady_clock::now();
 	while (g_running) {
 		ENetEvent ev;
 		while (enet_host_service(server, &ev, 10) > 0) {
@@ -419,10 +496,21 @@ int main(int argc, char** argv) {
 		}
 		drainRtc(brushes, lights, server);
 
-		// Broadcast everyone's position ~20 Hz so clients can render each other.
 		const auto now = std::chrono::steady_clock::now();
+
+		// Rebuild the navmesh after geometry edits (throttled to once a second to survive drags).
+		if (g_navDirty && std::chrono::duration_cast<std::chrono::seconds>(now - lastNavBuild).count() >= 1) {
+			g_nav.build(brushes);
+			g_navDirty = false;
+			lastNavBuild = now;
+		}
+
+		// Step the AI and broadcast everyone (players + agents) ~20 Hz so clients can render them.
 		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStateBroadcast).count() >= 50) {
+			const float dt = std::chrono::duration<float>(now - lastStateBroadcast).count();
+			stepAgents(dt);
 			if (!g_players.empty()) broadcastAll(server, buildPlayerStates());
+			if (!g_agents.empty()) broadcastAll(server, buildAgentStates());
 			lastStateBroadcast = now;
 		}
 

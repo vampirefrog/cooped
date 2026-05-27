@@ -150,6 +150,13 @@ struct RemotePlayer {
 	float yaw = 0.0f, pitch = 0.0f;
 };
 
+struct AiAgent {  // server-driven wandering AI; pos is its feet on the navmesh
+	bx::Vec3 pos = bx::Vec3(0, 0, 0);
+	float yaw = 0.0f;
+};
+
+const bx::Vec3 kAgentHalf(10.0f, 10.0f, 16.0f);  // a smaller cube than the player avatar
+
 struct Mesh {
 	bgfx::VertexBufferHandle vbh = BGFX_INVALID_HANDLE;
 	bgfx::IndexBufferHandle  ibh = BGFX_INVALID_HANDLE;
@@ -231,6 +238,8 @@ struct App {
 	bool versionMismatch = false;                     // server protocol version != ours
 	std::map<uint32_t, RemotePlayer> remotePlayers;   // other players, by id
 	Mesh avatarMesh;                                  // body-sized box for rendering them
+	std::map<uint32_t, AiAgent> agents;               // server-driven AI agents, by id
+	Mesh agentMesh;                                   // small cube for rendering them
 	uint64_t lastStateSendNs = 0;
 
 	Camera cam;
@@ -764,6 +773,17 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			if (r.ok && lm.valid()) applyLightmapTexture(app, lm.w, lm.h, lm.pixels, lm.vertexUV);
 			break;
 		}
+		case MsgType::AgentStates: {  // server-driven AI agent positions
+			const uint32_t n = r.u32();
+			app->agents.clear();
+			for (uint32_t i = 0; i < n && r.ok; ++i) {
+				const uint32_t id = r.u32();
+				const bx::Vec3 p = r.vec3();
+				const float yaw = r.f32();
+				if (r.ok) app->agents[id] = AiAgent{p, yaw};
+			}
+			break;
+		}
 		case MsgType::PlayerState:  // client->server only
 			break;
 	}
@@ -941,6 +961,8 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 
 	// Avatar: a body-sized box centered at origin (translated per remote player when drawn).
 	app->avatarMesh = buildMeshFromBrush(makeBox({0, 0, 0}, kPlayerHalf, 0.8f, 0.8f, 0.8f), app->layout);
+	// AI agent: a smaller, brighter cube (orange) centered at origin.
+	app->agentMesh = buildMeshFromBrush(makeBox({0, 0, 0}, kAgentHalf, 0.95f, 0.55f, 0.15f), app->layout);
 
 	buildInitialScene(app);  // local sandbox; replaced by the server snapshot if we connect
 	rebuildGrid(app);
@@ -1251,6 +1273,24 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		}
 	}
 
+	// AI agents: a small orange cube sitting on the navmesh (raise by half its height).
+	if (bgfx::isValid(app->agentMesh.vbh)) {
+		const float col[4] = {0.95f, 0.55f, 0.15f, 1.0f};
+		for (const auto& kv : app->agents) {
+			const AiAgent& ag = kv.second;
+			float mtx[16];
+			bx::mtxTranslate(mtx, ag.pos.x, ag.pos.y, ag.pos.z + kAgentHalf.z);
+			bgfx::setTransform(mtx);
+			bgfx::setTexture(0, app->s_tex, app->whiteTex);
+			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
+			bgfx::setVertexBuffer(0, app->agentMesh.vbh);
+			bgfx::setIndexBuffer(app->agentMesh.ibh);
+			bgfx::setUniform(app->u_albedo, col);
+			bgfx::setState(triState);
+			bgfx::submit(0, app->program);
+		}
+	}
+
 	// Outline a face (selected = bright, else targeted = subtle) — the polygon edges as lines,
 	// lifted slightly off the surface. Easier on the eyes than recoloring the whole face.
 	const bool haveSel = selIdx >= 0 && app->selectedFace >= 0;
@@ -1322,8 +1362,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		                    app->onGround ? "[grounded]" : "[airborne]");
 	}
 	if (app->net)
-		bgfx::dbgTextPrintf(1, 0, 0x0b, "%s  players online: %zu",
-		                    app->online ? "online" : "connecting", app->remotePlayers.size() + 1);
+		bgfx::dbgTextPrintf(1, 0, 0x0b, "%s  players online: %zu  AI agents: %zu",
+		                    app->online ? "online" : "connecting", app->remotePlayers.size() + 1,
+		                    app->agents.size());
 
 	bgfx::frame();
 	return SDL_APP_CONTINUE;
@@ -1336,6 +1377,7 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		for (Mesh& m : app->meshes) m.destroy();
 		app->grid.destroy();
 		app->avatarMesh.destroy();
+		app->agentMesh.destroy();
 		if (bgfx::isValid(app->lightWire)) bgfx::destroy(app->lightWire);
 		for (bgfx::UniformHandle u : {app->u_lightParams, app->u_sunDir, app->u_lightPosRadius, app->u_lightColor})
 			if (bgfx::isValid(u)) bgfx::destroy(u);

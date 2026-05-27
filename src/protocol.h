@@ -12,7 +12,7 @@
 
 // Bump on any wire-format change. The server sends it in AssignId; the client compares and
 // surfaces a clear mismatch instead of silently rendering a garbled map.
-constexpr uint32_t kProtocolVersion = 6;
+constexpr uint32_t kProtocolVersion = 7;
 
 enum class MsgType : uint8_t {
 	Snapshot       = 1,  // server->client: full map
@@ -29,6 +29,7 @@ enum class MsgType : uint8_t {
 	DeleteLight    = 12, // light id
 	SetLightPos    = 13, // light id + position
 	Lightmap       = 14, // baked lightmap: atlas size + RGBM RGBA8 pixels + per-soup-vertex UVs
+	AgentStates    = 15, // server->clients: [count]{id, pos, yaw} of server-driven AI agents
 };
 
 struct ByteWriter {

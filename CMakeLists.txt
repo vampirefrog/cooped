@@ -103,6 +103,18 @@ if(NOT EMSCRIPTEN)
     GIT_SHALLOW    TRUE
   )
   FetchContent_MakeAvailable(embree)
+
+  # Recast/Detour: navmesh generation + pathfinding for server-side AI (native only).
+  set(RECASTNAVIGATION_DEMO     OFF CACHE BOOL "" FORCE)
+  set(RECASTNAVIGATION_TESTS    OFF CACHE BOOL "" FORCE)
+  set(RECASTNAVIGATION_EXAMPLES OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(
+    recastnavigation
+    GIT_REPOSITORY https://github.com/recastnavigation/recastnavigation.git
+    GIT_TAG        v1.6.0
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(recastnavigation)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -182,9 +194,10 @@ endif()
 # Dedicated server (native only): authoritative map + edit-op relay. No renderer.
 # ---------------------------------------------------------------------------
 if(NOT EMSCRIPTEN)
-  add_executable(cooped_server src/server_main.cpp src/brush.cpp)
+  add_executable(cooped_server src/server_main.cpp src/brush.cpp src/navmesh.cpp)
   target_include_directories(cooped_server PRIVATE src ${enet_SOURCE_DIR}/include)
-  target_link_libraries(cooped_server PRIVATE bx enet LibDataChannel::LibDataChannel)
+  target_link_libraries(cooped_server PRIVATE bx enet LibDataChannel::LibDataChannel
+                        RecastNavigation::Recast RecastNavigation::Detour)
 endif()
 
 # ---------------------------------------------------------------------------
