@@ -10,8 +10,9 @@
 #include <bx/math.h>
 
 struct Plane {
-	bx::Vec3 n;  // outward unit normal
-	float    d;  // plane: dot(n, p) == d  (interior is dot(n, p) <= d)
+	bx::Vec3 n;               // outward unit normal
+	float    d;               // plane: dot(n, p) == d  (interior is dot(n, p) <= d)
+	uint32_t textureId = 0;   // per-face texture index
 
 	Plane() : n(0.0f, 0.0f, 0.0f), d(0.0f) {}
 	Plane(const bx::Vec3& _n, float _d) : n(_n), d(_d) {}
@@ -24,18 +25,25 @@ struct BrushVertex {
 };
 
 struct Brush {
-	uint32_t id = 0;         // stable, server-assigned identifier (0 = unassigned)
-	uint32_t textureId = 0;  // index into the loaded texture set
+	uint32_t id = 0;  // stable, server-assigned identifier (0 = unassigned)
 	std::vector<Plane> planes;
 	float color[3] = {0.8f, 0.8f, 0.8f};
+};
+
+// Index range for one face's triangles within a brush mesh (for per-face texture binding).
+struct FaceRange {
+	uint32_t firstIndex;
+	uint32_t numIndices;
+	int      face;  // index into Brush::planes
 };
 
 // Axis-aligned box brush (6 planes).
 Brush makeBox(const bx::Vec3& center, const bx::Vec3& halfExtent, float r, float g, float b);
 
-// CSG hull build: convex brush -> triangle mesh (world-space positions + per-face normals).
+// CSG hull build: convex brush -> triangle mesh (world-space positions + per-face normals + UVs).
+// outFaces records each face's index range so the renderer can bind a per-face texture.
 void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
-                    std::vector<uint16_t>& outIndices);
+                    std::vector<uint16_t>& outIndices, std::vector<FaceRange>& outFaces);
 
 struct RayHit {
 	bool  hit  = false;

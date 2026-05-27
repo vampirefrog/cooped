@@ -105,6 +105,7 @@ struct Mesh {
 	bgfx::VertexBufferHandle vbh = BGFX_INVALID_HANDLE;
 	bgfx::IndexBufferHandle  ibh = BGFX_INVALID_HANDLE;
 	uint32_t numIndices = 0;
+	std::vector<FaceRange> faces;  // per-face index ranges (for per-face texture binding)
 	float color[4] = {0.8f, 0.8f, 0.8f, 1.0f};
 
 	void destroy() {
@@ -151,6 +152,7 @@ struct App {
 
 	// Player presence.
 	uint32_t myPlayerId = 0;                          // assigned by the server
+	bool versionMismatch = false;                     // server protocol version != ours
 	std::map<uint32_t, RemotePlayer> remotePlayers;   // other players, by id
 	Mesh avatarMesh;                                  // body-sized box for rendering them
 	uint64_t lastStateSendNs = 0;
@@ -196,7 +198,8 @@ void accelerate(bx::Vec3& vel, const bx::Vec3& wishDir, float wishSpeed, float a
 Mesh buildMeshFromBrush(const Brush& brush, const bgfx::VertexLayout& layout) {
 	std::vector<BrushVertex> verts;
 	std::vector<uint16_t> indices;
-	buildBrushMesh(brush, verts, indices);
+	std::vector<FaceRange> faces;
+	buildBrushMesh(brush, verts, indices, faces);
 	Mesh m;
 	if (!verts.empty() && !indices.empty()) {
 		m.vbh = bgfx::createVertexBuffer(
@@ -204,6 +207,7 @@ Mesh buildMeshFromBrush(const Brush& brush, const bgfx::VertexLayout& layout) {
 		m.ibh = bgfx::createIndexBuffer(
 		    bgfx::copy(indices.data(), uint32_t(indices.size() * sizeof(uint16_t))));
 		m.numIndices = uint32_t(indices.size());
+		m.faces = std::move(faces);
 	}
 	m.color[0] = brush.color[0];
 	m.color[1] = brush.color[1];
@@ -361,18 +365,20 @@ void nudgeSelected(App* app, const bx::Vec3& dir) {
 	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);
 }
 
-// Cycle the selected brush to the next texture (id-based; synced when online).
+// Cycle the SELECTED FACE to the next texture (synced when online).
 void cycleTexture(App* app) {
 	const int bi = indexOfId(app->brushes, app->selectedId);
-	if (bi < 0 || app->textures.empty()) return;
-	const uint32_t next = (app->brushes[bi].textureId + 1) % (uint32_t)app->textures.size();
+	if (bi < 0 || app->selectedFace < 0 || app->textures.empty()) return;
+	if (app->selectedFace >= (int)app->brushes[bi].planes.size()) return;
+	const uint32_t next =
+	    (app->brushes[bi].planes[app->selectedFace].textureId + 1) % (uint32_t)app->textures.size();
 	if (app->online) {
-		sendMsg(app, msgSetBrushTexture(app->selectedId, next));
+		sendMsg(app, msgSetFaceTexture(app->selectedId, (uint32_t)app->selectedFace, next));
 		return;
 	}
 	pushUndo(app);
 	resetPushPull(app);
-	app->brushes[bi].textureId = next;  // no mesh rebuild — texture is bound at draw time
+	app->brushes[bi].planes[app->selectedFace].textureId = next;  // bound at draw — no rebuild
 }
 
 // Apply a message received from the server to the local map.
@@ -434,9 +440,14 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			}
 			break;
 		}
-		case MsgType::AssignId:
+		case MsgType::AssignId: {
 			app->myPlayerId = r.u32();
+			const uint32_t serverVersion = r.u32();
+			app->versionMismatch = (!r.ok || serverVersion != kProtocolVersion);
+			if (app->versionMismatch)
+				SDL_Log("protocol mismatch: server v%u, client v%u", serverVersion, kProtocolVersion);
 			break;
+		}
 		case MsgType::PlayerStates: {
 			const uint32_t n = r.u32();
 			app->remotePlayers.clear();
@@ -448,11 +459,13 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			}
 			break;
 		}
-		case MsgType::SetBrushTexture: {
+		case MsgType::SetFaceTexture: {
 			const uint32_t id = r.u32();
+			const uint32_t face = r.u32();
 			const uint32_t tid = r.u32();
 			const int bi = indexOfId(app->brushes, id);
-			if (r.ok && bi >= 0) app->brushes[bi].textureId = tid;
+			if (r.ok && bi >= 0 && face < app->brushes[bi].planes.size())
+				app->brushes[bi].planes[face].textureId = tid;
 			break;
 		}
 		case MsgType::PlayerState:  // client->server only
@@ -777,15 +790,17 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	for (int i = 0; i < (int)app->meshes.size(); ++i) {
 		const Mesh& m = app->meshes[i];
 		if (!bgfx::isValid(m.vbh)) continue;
-		// Textured by the brush's textureId; selection/targeting shown by the face outline below.
-		const uint32_t tid = app->brushes[i].textureId;
-		const bgfx::TextureHandle tex = (tid < app->textures.size()) ? app->textures[tid] : app->whiteTex;
-		bgfx::setTexture(0, app->s_tex, tex);
-		bgfx::setVertexBuffer(0, m.vbh);
-		bgfx::setIndexBuffer(m.ibh);
-		bgfx::setUniform(app->u_albedo, white);
-		bgfx::setState(triState);
-		bgfx::submit(0, app->program);
+		// Draw each face with its own texture (selection/targeting shown by the outline below).
+		for (const FaceRange& fr : m.faces) {
+			const uint32_t tid = app->brushes[i].planes[fr.face].textureId;
+			const bgfx::TextureHandle tex = (tid < app->textures.size()) ? app->textures[tid] : app->whiteTex;
+			bgfx::setTexture(0, app->s_tex, tex);
+			bgfx::setVertexBuffer(0, m.vbh);
+			bgfx::setIndexBuffer(m.ibh, fr.firstIndex, fr.numIndices);
+			bgfx::setUniform(app->u_albedo, white);
+			bgfx::setState(triState);
+			bgfx::submit(0, app->program);
+		}
 	}
 
 	// Remote players: a body-sized box at each (eye pos minus eye offset = body centre).
@@ -856,6 +871,8 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	}
 
 	bgfx::dbgTextClear();
+	if (app->versionMismatch)
+		bgfx::dbgTextPrintf(1, 5, 0x4f, " SERVER PROTOCOL MISMATCH - rebuild & restart the server ");
 	if (app->editMode) {
 		const uint16_t cols = uint16_t(app->width / 8), rows = uint16_t(app->height / 16);
 		bgfx::dbgTextPrintf(cols / 2, rows / 2, 0x0f, "+");  // crosshair

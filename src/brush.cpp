@@ -126,10 +126,11 @@ void translateBrush(Brush& brush, const bx::Vec3& delta) {
 }
 
 void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
-                    std::vector<uint16_t>& outIndices) {
+                    std::vector<uint16_t>& outIndices, std::vector<FaceRange>& outFaces) {
 	for (size_t i = 0; i < brush.planes.size(); ++i) {
 		const std::vector<bx::Vec3> poly = brushFacePolygon(brush, i);
 		if (poly.size() < 3) continue;  // degenerate / clipped away
+		const uint32_t faceFirstIndex = (uint32_t)outIndices.size();
 
 		const bx::Vec3& nrm = brush.planes[i].n;
 		const uint16_t base = static_cast<uint16_t>(outVerts.size());
@@ -148,5 +149,6 @@ void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
 			outIndices.push_back(static_cast<uint16_t>(base + k));
 			outIndices.push_back(static_cast<uint16_t>(base + k + 1));
 		}
+		outFaces.push_back({faceFirstIndex, (uint32_t)outIndices.size() - faceFirstIndex, (int)i});
 	}
 }

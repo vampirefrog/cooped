@@ -10,6 +10,10 @@
 
 #include "brush.h"
 
+// Bump on any wire-format change. The server sends it in AssignId; the client compares and
+// surfaces a clear mismatch instead of silently rendering a garbled map.
+constexpr uint32_t kProtocolVersion = 2;
+
 enum class MsgType : uint8_t {
 	Snapshot       = 1,  // server->client: full map
 	CreateBrush    = 2,  // client->server: geometry (id=0); server->clients: with assigned id
@@ -19,7 +23,7 @@ enum class MsgType : uint8_t {
 	AssignId       = 6,  // server->client: your player id
 	PlayerState    = 7,  // client->server: my pos + yaw + pitch
 	PlayerStates   = 8,  // server->clients: [count]{id,pos,yaw,pitch} of everyone
-	SetBrushTexture = 9, // brush id + texture index
+	SetFaceTexture = 9,  // brush id + face index + texture index
 };
 
 struct ByteWriter {
@@ -43,22 +47,22 @@ struct ByteReader {
 
 inline void writeBrush(ByteWriter& w, const Brush& b) {
 	w.u32(b.id);
-	w.u32(b.textureId);
 	w.f32(b.color[0]); w.f32(b.color[1]); w.f32(b.color[2]);
 	w.u32((uint32_t)b.planes.size());
-	for (const Plane& pl : b.planes) { w.vec3(pl.n); w.f32(pl.d); }
+	for (const Plane& pl : b.planes) { w.vec3(pl.n); w.f32(pl.d); w.u32(pl.textureId); }
 }
 
 inline Brush readBrush(ByteReader& r) {
 	Brush b;
 	b.id = r.u32();
-	b.textureId = r.u32();
 	b.color[0] = r.f32(); b.color[1] = r.f32(); b.color[2] = r.f32();
 	const uint32_t n = r.u32();
 	for (uint32_t i = 0; i < n && r.ok; ++i) {
 		const bx::Vec3 nrm = r.vec3();
 		const float d = r.f32();
-		b.planes.emplace_back(nrm, d);
+		Plane pl(nrm, d);
+		pl.textureId = r.u32();
+		b.planes.push_back(pl);
 	}
 	return b;
 }
@@ -102,10 +106,11 @@ inline std::vector<uint8_t> msgSetPlaneD(uint32_t id, uint32_t face, float d) {
 	return w.data;
 }
 
-inline std::vector<uint8_t> msgAssignId(uint32_t id) {
+inline std::vector<uint8_t> msgAssignId(uint32_t id, uint32_t protocolVersion) {
 	ByteWriter w;
 	w.u8((uint8_t)MsgType::AssignId);
 	w.u32(id);
+	w.u32(protocolVersion);
 	return w.data;
 }
 
@@ -118,10 +123,11 @@ inline std::vector<uint8_t> msgPlayerState(const bx::Vec3& pos, float yaw, float
 	return w.data;
 }
 
-inline std::vector<uint8_t> msgSetBrushTexture(uint32_t id, uint32_t textureId) {
+inline std::vector<uint8_t> msgSetFaceTexture(uint32_t id, uint32_t face, uint32_t textureId) {
 	ByteWriter w;
-	w.u8((uint8_t)MsgType::SetBrushTexture);
+	w.u8((uint8_t)MsgType::SetFaceTexture);
 	w.u32(id);
+	w.u32(face);
 	w.u32(textureId);
 	return w.data;
 }
