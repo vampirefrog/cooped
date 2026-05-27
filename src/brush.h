@@ -35,8 +35,9 @@ void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
                     std::vector<uint16_t>& outIndices);
 
 struct RayHit {
-	bool  hit = false;
-	float t   = 0.0f;  // distance along the ray to the nearest surface
+	bool  hit  = false;
+	float t    = 0.0f;   // distance along the ray to the nearest surface
+	int   face = -1;     // index of the face (plane) the ray entered through
 };
 
 // Ray vs convex brush (slab clip against the half-spaces). Ray dir need not be normalized.
@@ -44,3 +45,12 @@ RayHit rayBrushIntersect(const bx::Vec3& ro, const bx::Vec3& rd, const Brush& br
 
 // Translate a brush by delta (shift every plane's distance).
 void translateBrush(Brush& brush, const bx::Vec3& delta);
+
+// Convex polygon for one face (its plane clipped by every other half-space).
+// Empty if the face is degenerate (e.g. clipped away).
+std::vector<bx::Vec3> brushFacePolygon(const Brush& brush, size_t faceIndex);
+
+// Triangle-list mesh for a single face, positions pushed out along the normal by 'bias'
+// (used for the edit-mode face highlight overlay).
+void buildFaceMesh(const Brush& brush, size_t faceIndex, float bias,
+                   std::vector<BrushVertex>& outTris);

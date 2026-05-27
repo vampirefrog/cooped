@@ -54,6 +54,32 @@ void clipByPlane(std::vector<bx::Vec3>& poly, const Plane& pl) {
 
 }  // namespace
 
+std::vector<bx::Vec3> brushFacePolygon(const Brush& brush, size_t faceIndex) {
+	const std::vector<Plane>& planes = brush.planes;
+	std::vector<bx::Vec3> poly = initialFacePolygon(planes[faceIndex]);
+	for (size_t j = 0; j < planes.size() && !poly.empty(); ++j) {
+		if (j != faceIndex) clipByPlane(poly, planes[j]);
+	}
+	if (poly.size() < 3) poly.clear();
+	return poly;
+}
+
+void buildFaceMesh(const Brush& brush, size_t faceIndex, float bias,
+                   std::vector<BrushVertex>& outTris) {
+	const std::vector<bx::Vec3> poly = brushFacePolygon(brush, faceIndex);
+	if (poly.size() < 3) return;
+	const bx::Vec3& n = brush.planes[faceIndex].n;
+	const bx::Vec3 off = scale(n, bias);
+	for (size_t k = 1; k + 1 < poly.size(); ++k) {  // triangle fan
+		const bx::Vec3 a = bx::add(poly[0], off);
+		const bx::Vec3 b = bx::add(poly[k], off);
+		const bx::Vec3 c = bx::add(poly[k + 1], off);
+		outTris.push_back({a.x, a.y, a.z, n.x, n.y, n.z});
+		outTris.push_back({b.x, b.y, b.z, n.x, n.y, n.z});
+		outTris.push_back({c.x, c.y, c.z, n.x, n.y, n.z});
+	}
+}
+
 Brush makeBox(const bx::Vec3& c, const bx::Vec3& h, float r, float g, float b) {
 	Brush brush;
 	brush.color[0] = r;
@@ -73,7 +99,9 @@ Brush makeBox(const bx::Vec3& c, const bx::Vec3& h, float r, float g, float b) {
 RayHit rayBrushIntersect(const bx::Vec3& ro, const bx::Vec3& rd, const Brush& brush) {
 	float tmin = -1.0e30f;
 	float tmax = 1.0e30f;
-	for (const Plane& pl : brush.planes) {
+	int enterFace = -1;
+	for (int i = 0; i < (int)brush.planes.size(); ++i) {
+		const Plane& pl = brush.planes[i];
 		const float denom = bx::dot(pl.n, rd);
 		const float dist = bx::dot(pl.n, ro) - pl.d;  // >0 outside the interior
 		if (bx::abs(denom) < 1.0e-6f) {
@@ -82,7 +110,7 @@ RayHit rayBrushIntersect(const bx::Vec3& ro, const bx::Vec3& rd, const Brush& br
 		}
 		const float t = -dist / denom;
 		if (denom < 0.0f) {            // ray entering this half-space
-			if (t > tmin) tmin = t;
+			if (t > tmin) { tmin = t; enterFace = i; }
 		} else {                       // ray exiting this half-space
 			if (t < tmax) tmax = t;
 		}
@@ -90,7 +118,7 @@ RayHit rayBrushIntersect(const bx::Vec3& ro, const bx::Vec3& rd, const Brush& br
 	}
 	const float t = (tmin > 1.0e-4f) ? tmin : tmax;  // nearest surface ahead of the origin
 	if (t < 1.0e-4f) return {};
-	return {true, t};
+	return {true, t, (tmin > 1.0e-4f) ? enterFace : -1};
 }
 
 void translateBrush(Brush& brush, const bx::Vec3& delta) {
@@ -99,15 +127,11 @@ void translateBrush(Brush& brush, const bx::Vec3& delta) {
 
 void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
                     std::vector<uint16_t>& outIndices) {
-	const std::vector<Plane>& planes = brush.planes;
-	for (size_t i = 0; i < planes.size(); ++i) {
-		std::vector<bx::Vec3> poly = initialFacePolygon(planes[i]);
-		for (size_t j = 0; j < planes.size() && !poly.empty(); ++j) {
-			if (j != i) clipByPlane(poly, planes[j]);
-		}
+	for (size_t i = 0; i < brush.planes.size(); ++i) {
+		const std::vector<bx::Vec3> poly = brushFacePolygon(brush, i);
 		if (poly.size() < 3) continue;  // degenerate / clipped away
 
-		const bx::Vec3& nrm = planes[i].n;
+		const bx::Vec3& nrm = brush.planes[i].n;
 		const uint16_t base = static_cast<uint16_t>(outVerts.size());
 		for (const bx::Vec3& p : poly) {
 			outVerts.push_back({p.x, p.y, p.z, nrm.x, nrm.y, nrm.z});
