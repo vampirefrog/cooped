@@ -71,6 +71,15 @@ if(NOT EMSCRIPTEN)
     GIT_TAG        v0.24.3
   )
   FetchContent_MakeAvailable(libdatachannel)
+
+  # xatlas: lightmap UV unwrap for the GI bake (native only; no CMakeLists, just one .cpp).
+  FetchContent_Declare(
+    xatlas
+    GIT_REPOSITORY https://github.com/jpcy/xatlas.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+  )
+  FetchContent_MakeAvailable(xatlas)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -140,6 +149,9 @@ if(NOT EMSCRIPTEN)
   add_dependencies(cooped cooped_shaders)
   target_link_libraries(cooped PRIVATE enet)
   target_include_directories(cooped PRIVATE ${enet_SOURCE_DIR}/include)  # enet doesn't export it
+  # GI lightmap bake (native only): xatlas unwrap. (Embree + radiosity to follow.)
+  target_sources(cooped PRIVATE src/bake.cpp ${xatlas_SOURCE_DIR}/source/xatlas/xatlas.cpp)
+  target_include_directories(cooped PRIVATE ${xatlas_SOURCE_DIR}/source/xatlas)
 endif()
 
 # ---------------------------------------------------------------------------

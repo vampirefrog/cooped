@@ -25,6 +25,9 @@
 #include "net.h"
 #include "physics.h"
 #include "protocol.h"
+#if !defined(__EMSCRIPTEN__)
+#include "bake.h"
+#endif
 
 #include "shaders/generated/glsl/vs_world.sc.bin.h"
 #include "shaders/generated/essl/vs_world.sc.bin.h"
@@ -976,6 +979,14 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 					switch (event->key.key) {
 						case SDLK_RETURN: createBrushAtAim(app); break;
 						case SDLK_T: cycleTexture(app); break;
+#if !defined(__EMSCRIPTEN__)
+						case SDLK_F6: {  // GI bake: unwrap the world (lightmap fill to follow)
+							const BakeResult br = bakeLightmaps(app->brushes);
+							SDL_Log("bake: ok=%d  atlas %ux%u  charts=%u", br.ok, br.atlasWidth,
+							        br.atlasHeight, br.chartCount);
+							break;
+						}
+#endif
 						case SDLK_L: createLight(app); break;
 						case SDLK_K: deleteNearestLight(app); break;
 						case SDLK_C: app->placeColorIdx = (app->placeColorIdx + 1) % 5; break;
