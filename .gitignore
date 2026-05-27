@@ -1,6 +1,9 @@
 # Emscripten SDK (local toolchain checkout)
 /emsdk/
 
+# Saved maps (server persistence output)
+*.map
+
 # Build output
 /build/
 /build-*/

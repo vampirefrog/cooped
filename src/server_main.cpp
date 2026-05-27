@@ -4,6 +4,8 @@
 //   * WebRTC DataChannels   for browser clients, with WebSocket signaling (libdatachannel)
 // Edit ops from either transport are applied and rebroadcast to every client.
 
+#include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +26,47 @@ namespace {
 constexpr uint16_t kDefaultPort = 27500;  // ENet UDP; WebSocket signaling = this + 1
 
 uint32_t g_nextId = 1;
+bool g_dirty = false;                       // map changed since last save
+volatile std::sig_atomic_t g_running = 1;   // cleared by SIGINT/SIGTERM for a clean save-on-exit
+
+void onSignal(int) { g_running = 0; }
+
+// Persist / restore the authoritative map (reuses the brush wire encoding from protocol.h).
+bool saveMap(const char* path, const std::vector<Brush>& brushes) {
+	ByteWriter w;
+	w.u8('C'); w.u8('M'); w.u8('A'); w.u8('P');  // magic
+	w.u32(1);                                     // version
+	w.u32(g_nextId);
+	w.u32((uint32_t)brushes.size());
+	for (const Brush& b : brushes) writeBrush(w, b);
+	FILE* f = fopen(path, "wb");
+	if (!f) return false;
+	const bool ok = fwrite(w.data.data(), 1, w.data.size(), f) == w.data.size();
+	fclose(f);
+	return ok;
+}
+
+bool loadMap(const char* path, std::vector<Brush>& brushes) {
+	FILE* f = fopen(path, "rb");
+	if (!f) return false;
+	fseek(f, 0, SEEK_END);
+	const long size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	std::vector<uint8_t> buf(size > 0 ? (size_t)size : 0);
+	const size_t got = buf.empty() ? 0 : fread(buf.data(), 1, buf.size(), f);
+	fclose(f);
+	if (got != buf.size() || buf.size() < 16) return false;
+	ByteReader r(buf.data(), buf.size());
+	if (r.u8() != 'C' || r.u8() != 'M' || r.u8() != 'A' || r.u8() != 'P') return false;
+	r.u32();                       // version
+	g_nextId = r.u32();
+	const uint32_t n = r.u32();
+	std::vector<Brush> loaded;
+	for (uint32_t i = 0; i < n && r.ok; ++i) loaded.push_back(readBrush(r));
+	if (!r.ok || loaded.size() != n) return false;
+	brushes = std::move(loaded);
+	return true;
+}
 
 // --- WebRTC peer registry + a thread-safe inbound queue (libdatachannel callbacks run on
 //     their own threads; the main loop drains the queue and owns the brush map). -----------
@@ -191,7 +234,7 @@ void drainRtc(std::vector<Brush>& brushes, ENetHost* host) {
 				break;
 			case InKind::Data: {
 				const std::vector<uint8_t> rb = applyOp(brushes, m.bytes.data(), m.bytes.size());
-				if (!rb.empty()) broadcastAll(host, rb);
+				if (!rb.empty()) { broadcastAll(host, rb); g_dirty = true; }
 				break;
 			}
 			case InKind::Leave:
@@ -231,12 +274,23 @@ int main(int argc, char** argv) {
 	rtc::WebSocketServer wsServer(wsCfg);
 	wsServer.onClient(onWebSocketClient);
 
-	std::vector<Brush> brushes;
-	buildScene(brushes);
-	printf("cooped server: ENet udp:%u, WebRTC signaling %s:%u  (%zu brushes)\n", port,
-	       wsCfg.enableTls ? "wss" : "ws", wsPort, brushes.size());
+	const char* mapPath = getenv("COOPED_MAP");
+	if (!mapPath) mapPath = "cooped.map";
 
-	for (;;) {
+	std::vector<Brush> brushes;
+	if (loadMap(mapPath, brushes))
+		printf("loaded map '%s' (%zu brushes)\n", mapPath, brushes.size());
+	else
+		buildScene(brushes);
+
+	std::signal(SIGINT, onSignal);
+	std::signal(SIGTERM, onSignal);
+
+	printf("cooped server: ENet udp:%u, WebRTC signaling %s:%u  (%zu brushes, map='%s')\n", port,
+	       wsCfg.enableTls ? "wss" : "ws", wsPort, brushes.size(), mapPath);
+
+	auto lastSave = std::chrono::steady_clock::now();
+	while (g_running) {
 		ENetEvent ev;
 		while (enet_host_service(server, &ev, 10) > 0) {
 			switch (ev.type) {
@@ -250,7 +304,7 @@ int main(int argc, char** argv) {
 				case ENET_EVENT_TYPE_RECEIVE: {
 					const std::vector<uint8_t> rb = applyOp(brushes, ev.packet->data, ev.packet->dataLength);
 					enet_packet_destroy(ev.packet);
-					if (!rb.empty()) broadcastAll(server, rb);
+					if (!rb.empty()) { broadcastAll(server, rb); g_dirty = true; }
 					break;
 				}
 				case ENET_EVENT_TYPE_DISCONNECT:
@@ -261,5 +315,16 @@ int main(int argc, char** argv) {
 			}
 		}
 		drainRtc(brushes, server);
+
+		// Autosave at most every 5s when the map has changed.
+		const auto now = std::chrono::steady_clock::now();
+		if (g_dirty && std::chrono::duration_cast<std::chrono::seconds>(now - lastSave).count() >= 5) {
+			if (saveMap(mapPath, brushes)) { g_dirty = false; printf("autosaved '%s'\n", mapPath); }
+			lastSave = now;
+		}
 	}
+
+	if (g_dirty) printf(saveMap(mapPath, brushes) ? "saved '%s' on exit\n" : "save failed\n", mapPath);
+	enet_host_destroy(server);
+	return 0;
 }
