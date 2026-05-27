@@ -70,6 +70,33 @@ Brush makeBox(const bx::Vec3& c, const bx::Vec3& h, float r, float g, float b) {
 	return brush;
 }
 
+RayHit rayBrushIntersect(const bx::Vec3& ro, const bx::Vec3& rd, const Brush& brush) {
+	float tmin = -1.0e30f;
+	float tmax = 1.0e30f;
+	for (const Plane& pl : brush.planes) {
+		const float denom = bx::dot(pl.n, rd);
+		const float dist = bx::dot(pl.n, ro) - pl.d;  // >0 outside the interior
+		if (bx::abs(denom) < 1.0e-6f) {
+			if (dist > 0.0f) return {};  // parallel and outside this half-space
+			continue;
+		}
+		const float t = -dist / denom;
+		if (denom < 0.0f) {            // ray entering this half-space
+			if (t > tmin) tmin = t;
+		} else {                       // ray exiting this half-space
+			if (t < tmax) tmax = t;
+		}
+		if (tmin > tmax) return {};
+	}
+	const float t = (tmin > 1.0e-4f) ? tmin : tmax;  // nearest surface ahead of the origin
+	if (t < 1.0e-4f) return {};
+	return {true, t};
+}
+
+void translateBrush(Brush& brush, const bx::Vec3& delta) {
+	for (Plane& pl : brush.planes) pl.d += bx::dot(pl.n, delta);
+}
+
 void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
                     std::vector<uint16_t>& outIndices) {
 	const std::vector<Plane>& planes = brush.planes;

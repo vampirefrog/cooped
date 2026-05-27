@@ -33,3 +33,14 @@ Brush makeBox(const bx::Vec3& center, const bx::Vec3& halfExtent, float r, float
 // CSG hull build: convex brush -> triangle mesh (world-space positions + per-face normals).
 void buildBrushMesh(const Brush& brush, std::vector<BrushVertex>& outVerts,
                     std::vector<uint16_t>& outIndices);
+
+struct RayHit {
+	bool  hit = false;
+	float t   = 0.0f;  // distance along the ray to the nearest surface
+};
+
+// Ray vs convex brush (slab clip against the half-spaces). Ray dir need not be normalized.
+RayHit rayBrushIntersect(const bx::Vec3& ro, const bx::Vec3& rd, const Brush& brush);
+
+// Translate a brush by delta (shift every plane's distance).
+void translateBrush(Brush& brush, const bx::Vec3& delta);
