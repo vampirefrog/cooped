@@ -101,7 +101,28 @@ if(NOT EMSCRIPTEN)
     AS_HEADERS
     OUT_FILES_VAR FS_SHADER_HEADERS
   )
-  add_custom_target(cooped_shaders DEPENDS ${VS_SHADER_HEADERS} ${FS_SHADER_HEADERS})
+  bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_SRC_DIR}/vs_sky.sc
+    VARYING_DEF ${SHADER_SRC_DIR}/varying_sky.def.sc
+    OUTPUT_DIR ${GEN_SHADER_DIR}
+    INCLUDE_DIRS ${bgfx_SOURCE_DIR}/bgfx/src
+    PROFILES 430 300_es spirv
+    AS_HEADERS
+    OUT_FILES_VAR VS_SKY_HEADERS
+  )
+  bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_SRC_DIR}/fs_sky.sc
+    VARYING_DEF ${SHADER_SRC_DIR}/varying_sky.def.sc
+    OUTPUT_DIR ${GEN_SHADER_DIR}
+    INCLUDE_DIRS ${bgfx_SOURCE_DIR}/bgfx/src
+    PROFILES 430 300_es spirv
+    AS_HEADERS
+    OUT_FILES_VAR FS_SKY_HEADERS
+  )
+  add_custom_target(cooped_shaders DEPENDS ${VS_SHADER_HEADERS} ${FS_SHADER_HEADERS}
+                                           ${VS_SKY_HEADERS} ${FS_SKY_HEADERS})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -154,5 +175,7 @@ if(EMSCRIPTEN)
     "--preload-file=${CMAKE_SOURCE_DIR}/data/brick.jpg@/data/brick.jpg"
     "--preload-file=${CMAKE_SOURCE_DIR}/data/floor.jpg@/data/floor.jpg"
     "--preload-file=${CMAKE_SOURCE_DIR}/data/tiles.jpg@/data/tiles.jpg"
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/rosendal_plains_2_1k.hdr@/data/rosendal_plains_2_1k.hdr"
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/sunny_rose_garden_1k.hdr@/data/sunny_rose_garden_1k.hdr"
   )
 endif()

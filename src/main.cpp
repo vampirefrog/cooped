@@ -32,6 +32,12 @@
 #include "shaders/generated/glsl/fs_world.sc.bin.h"
 #include "shaders/generated/essl/fs_world.sc.bin.h"
 #include "shaders/generated/spirv/fs_world.sc.bin.h"
+#include "shaders/generated/glsl/vs_sky.sc.bin.h"
+#include "shaders/generated/essl/vs_sky.sc.bin.h"
+#include "shaders/generated/spirv/vs_sky.sc.bin.h"
+#include "shaders/generated/glsl/fs_sky.sc.bin.h"
+#include "shaders/generated/essl/fs_sky.sc.bin.h"
+#include "shaders/generated/spirv/fs_sky.sc.bin.h"
 
 namespace {
 
@@ -92,6 +98,42 @@ bgfx::ProgramHandle createWorldProgram() {
 	return bgfx::createProgram(makeShader(vs, vsn), makeShader(fs, fsn), true);
 }
 
+bgfx::ProgramHandle createSkyProgram() {
+	const uint8_t *vs, *fs;
+	uint32_t vsn, fsn;
+	switch (bgfx::getRendererType()) {
+		case bgfx::RendererType::Vulkan:
+			vs = vs_sky_spv;  vsn = sizeof(vs_sky_spv);  fs = fs_sky_spv;  fsn = sizeof(fs_sky_spv);  break;
+		case bgfx::RendererType::OpenGLES:
+			vs = vs_sky_essl; vsn = sizeof(vs_sky_essl); fs = fs_sky_essl; fsn = sizeof(fs_sky_essl); break;
+		default:
+			vs = vs_sky_glsl; vsn = sizeof(vs_sky_glsl); fs = fs_sky_glsl; fsn = sizeof(fs_sky_glsl); break;
+	}
+	return bgfx::createProgram(makeShader(vs, vsn), makeShader(fs, fsn), true);
+}
+
+// Load a Radiance .hdr equirectangular map as a half-float texture (V clamped for the poles).
+bgfx::TextureHandle loadHdrTexture(const char* path) {
+	FILE* f = fopen(path, "rb");
+	if (!f) return BGFX_INVALID_HANDLE;
+	fseek(f, 0, SEEK_END);
+	const long size = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	std::vector<uint8_t> buf(size > 0 ? (size_t)size : 0);
+	const size_t got = buf.empty() ? 0 : fread(buf.data(), 1, buf.size(), f);
+	fclose(f);
+	if (got != buf.size() || buf.empty()) return BGFX_INVALID_HANDLE;
+	static bx::DefaultAllocator alloc;
+	bimg::ImageContainer* img =
+	    bimg::imageParse(&alloc, buf.data(), (uint32_t)buf.size(), bimg::TextureFormat::RGBA16F);
+	if (!img) return BGFX_INVALID_HANDLE;
+	bgfx::TextureHandle h = bgfx::createTexture2D(
+	    (uint16_t)img->m_width, (uint16_t)img->m_height, false, 1, bgfx::TextureFormat::RGBA16F,
+	    BGFX_SAMPLER_V_CLAMP, bgfx::copy(img->m_data, img->m_size));
+	bimg::imageFree(img);
+	return h;
+}
+
 // A distinct-ish color per player id.
 void colorFromId(uint32_t id, float out[4]) {
 	out[0] = 0.35f + 0.6f * ((id * 73 % 100) / 100.0f);
@@ -141,6 +183,12 @@ struct App {
 	bgfx::UniformHandle s_tex = BGFX_INVALID_HANDLE;
 	std::vector<bgfx::TextureHandle> textures;            // loaded texture set
 	bgfx::TextureHandle whiteTex = BGFX_INVALID_HANDLE;   // 1x1 white (untextured draws)
+	// HDR skybox.
+	bgfx::ProgramHandle skyProgram = BGFX_INVALID_HANDLE;
+	bgfx::TextureHandle skyTex[2] = {BGFX_INVALID_HANDLE, BGFX_INVALID_HANDLE};
+	int skyIdx = 0;
+	bgfx::UniformHandle s_sky = BGFX_INVALID_HANDLE, u_skyParams = BGFX_INVALID_HANDLE;
+	bgfx::VertexBufferHandle fullscreen = BGFX_INVALID_HANDLE;  // fullscreen triangle
 	// Lighting uniforms.
 	bgfx::UniformHandle u_lightParams = BGFX_INVALID_HANDLE;     // x=count, y=ambient
 	bgfx::UniformHandle u_sunDir = BGFX_INVALID_HANDLE;          // xyz dir, w intensity
@@ -776,6 +824,7 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 	app->bgfxInitialized = true;
 
 	bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x202830ff, 1.0f, 0);
+	bgfx::setViewMode(0, bgfx::ViewMode::Sequential);  // draw in submit order: sky first, world over it
 	bgfx::setDebug(BGFX_DEBUG_TEXT);
 
 	app->layout.begin()
@@ -818,6 +867,17 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 		if (!bgfx::isValid(t)) { t = app->whiteTex; SDL_Log("texture load failed: %s", tf); }
 		app->textures.push_back(t);
 	}
+
+	// HDR skybox: program, uniforms, the two panoramas, and a fullscreen triangle.
+	app->skyProgram = createSkyProgram();
+	app->s_sky = bgfx::createUniform("s_sky", bgfx::UniformType::Sampler);
+	app->u_skyParams = bgfx::createUniform("u_skyParams", bgfx::UniformType::Vec4);
+	app->skyTex[0] = loadHdrTexture("data/rosendal_plains_2_1k.hdr");
+	app->skyTex[1] = loadHdrTexture("data/sunny_rose_garden_1k.hdr");
+	if (!bgfx::isValid(app->skyTex[0])) SDL_Log("skybox HDR load failed");
+	const BrushVertex fsTri[3] = {
+	    {-1, -1, 0, 0, 0, 0, 0, 0}, {3, -1, 0, 0, 0, 0, 0, 0}, {-1, 3, 0, 0, 0, 0, 0, 0}};
+	app->fullscreen = bgfx::createVertexBuffer(bgfx::copy(fsTri, sizeof(fsTri)), app->layout);
 
 	// Avatar: a body-sized box centered at origin (translated per remote player when drawn).
 	app->avatarMesh = buildMeshFromBrush(makeBox({0, 0, 0}, kPlayerHalf, 0.8f, 0.8f, 0.8f), app->layout);
@@ -895,6 +955,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 		case SDL_EVENT_KEY_DOWN:
 			switch (event->key.key) {
 				case SDLK_ESCAPE: return SDL_APP_SUCCESS;
+					case SDLK_B: app->skyIdx = (app->skyIdx + 1) % 2; break;  // cycle skybox
 				case SDLK_E:
 					app->editMode = !app->editMode;
 					app->selectedId = 0;
@@ -1036,6 +1097,16 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	bgfx::setViewTransform(0, view, proj);
 	bgfx::touch(0);
 
+	// HDR skybox: fullscreen triangle sampling the panorama by view ray (drawn first, no depth).
+	if (bgfx::isValid(app->skyProgram) && bgfx::isValid(app->skyTex[app->skyIdx])) {
+		const float skyp[4] = {1.0f, 0.0f, 0.0f, 0.0f};  // x = exposure
+		bgfx::setUniform(app->u_skyParams, skyp);
+		bgfx::setTexture(0, app->s_sky, app->skyTex[app->skyIdx]);
+		bgfx::setVertexBuffer(0, app->fullscreen);
+		bgfx::setState(BGFX_STATE_WRITE_RGB);  // no depth test/write -> background
+		bgfx::submit(0, app->skyProgram);  // u_invViewProj / u_invView are bgfx built-ins
+	}
+
 	const int selIdx = indexOfId(app->brushes, app->selectedId);
 	const uint64_t triState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z |
 	                          BGFX_STATE_DEPTH_TEST_LESS;
@@ -1160,7 +1231,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::dbgTextPrintf(1, 6, 0x0d, "lights:  L:place  drag a cube face to move  K:delete  C:color (%d)  |  count:%zu",
 		                    app->placeColorIdx, app->lights.size());
 	} else {
-		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   E:edit   esc:quit",
+		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   B:sky   E:edit   esc:quit",
 		                    app->onGround ? "[grounded]" : "[airborne]");
 	}
 	if (app->net)
@@ -1184,6 +1255,11 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		for (bgfx::TextureHandle t : app->textures)
 			if (bgfx::isValid(t) && t.idx != app->whiteTex.idx) bgfx::destroy(t);
 		if (bgfx::isValid(app->whiteTex)) bgfx::destroy(app->whiteTex);
+		for (bgfx::TextureHandle t : app->skyTex) if (bgfx::isValid(t)) bgfx::destroy(t);
+		if (bgfx::isValid(app->fullscreen)) bgfx::destroy(app->fullscreen);
+		if (bgfx::isValid(app->skyProgram)) bgfx::destroy(app->skyProgram);
+		for (bgfx::UniformHandle u : {app->s_sky, app->u_skyParams})
+			if (bgfx::isValid(u)) bgfx::destroy(u);
 		if (bgfx::isValid(app->s_tex)) bgfx::destroy(app->s_tex);
 		if (bgfx::isValid(app->u_albedo)) bgfx::destroy(app->u_albedo);
 		if (bgfx::isValid(app->program)) bgfx::destroy(app->program);
