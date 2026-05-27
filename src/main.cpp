@@ -88,6 +88,7 @@ struct App {
 	Camera cam;
 	bool editMode = true;
 	int  selected = -1;      // selected brush index, or -1
+	int  selectedFace = -1;  // selected face on that brush (the push/pull target)
 	int  targeted = -1;      // brush under the crosshair this frame
 	int  targetedFace = -1;  // face of that brush under the crosshair
 	int  ppBrush = -1, ppFace = -1;  // active push/pull face, for undo coalescing
@@ -162,6 +163,8 @@ void undo(App* app) {
 	app->redoStack.push_back(app->brushes);
 	app->brushes = app->undoStack.back();
 	app->undoStack.pop_back();
+	app->selected = -1;
+	app->selectedFace = -1;
 	resetPushPull(app);
 	rebuildSceneMeshes(app);
 }
@@ -171,29 +174,27 @@ void redo(App* app) {
 	app->undoStack.push_back(app->brushes);
 	app->brushes = app->redoStack.back();
 	app->redoStack.pop_back();
+	app->selected = -1;
+	app->selectedFace = -1;
 	resetPushPull(app);
 	rebuildSceneMeshes(app);
 }
 
-// Sauerbraten-style: push (out) or pull (in) the targeted face along its normal by one grid
-// step. Consecutive edits to the same face coalesce into a single undo entry.
+// Sauerbraten-style: push (out) or pull (in) the SELECTED face along its normal by one grid
+// step. No clamp — pulling past the brush's vertices is allowed (it cuts the brush, and the
+// plane is kept), so pushing back out restores the geometry. The face stays the push/pull
+// target until deselected. Consecutive edits to one face coalesce into a single undo entry.
 void pushPullFace(App* app, int dir) {
-	const int bi = app->targeted, fi = app->targetedFace;
-	if (bi < 0 || fi < 0) return;
+	const int bi = app->selected, fi = app->selectedFace;
+	if (bi < 0 || fi < 0 || bi >= (int)app->brushes.size()) return;
 	if (bi != app->ppBrush || fi != app->ppFace) {
 		pushUndo(app);
 		app->ppBrush = bi;
 		app->ppFace = fi;
 	}
-	Brush& b = app->brushes[bi];
-	const float oldD = b.planes[fi].d;
-	b.planes[fi].d += dir * app->gridStep;
-	if (brushFacePolygon(b, fi).empty()) {  // pulled through the opposite face — revert
-		b.planes[fi].d = oldD;
-		return;
-	}
+	app->brushes[bi].planes[fi].d += dir * app->gridStep;
 	app->meshes[bi].destroy();
-	app->meshes[bi] = buildMeshFromBrush(b, app->layout);
+	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);  // may be empty if collapsed
 }
 
 // Where the crosshair ray meets the z=0 plane (for brush placement).
@@ -213,6 +214,7 @@ void createBrushAtAim(App* app) {
 	pushUndo(app);
 	app->brushes.push_back(makeBox(center, {s * 0.5f, s * 0.5f, s * 0.5f}, 0.70f, 0.55f, 0.40f));
 	app->selected = (int)app->brushes.size() - 1;
+	app->selectedFace = -1;
 	resetPushPull(app);
 	rebuildSceneMeshes(app);
 }
@@ -222,6 +224,7 @@ void deleteSelected(App* app) {
 	pushUndo(app);
 	app->brushes.erase(app->brushes.begin() + app->selected);
 	app->selected = -1;
+	app->selectedFace = -1;
 	resetPushPull(app);
 	rebuildSceneMeshes(app);
 }
@@ -348,14 +351,15 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 			break;
 		case SDL_EVENT_MOUSE_BUTTON_DOWN:
 			if (app->editMode && event->button.button == SDL_BUTTON_LEFT) {
-				app->selected = app->targeted;  // select what the crosshair is on (or -1)
+				app->selected = app->targeted;          // brush under crosshair (or -1 = deselect)
+				app->selectedFace = app->targetedFace;  // the face becomes the push/pull target
 				resetPushPull(app);
 			}
 			break;
 		case SDL_EVENT_MOUSE_WHEEL:
-			if (app->editMode) {  // push (out) / pull (in) the targeted face
-				if (event->wheel.y > 0) pushPullFace(app, +1);
-				else if (event->wheel.y < 0) pushPullFace(app, -1);
+			if (app->editMode) {  // wheel up = push out, wheel down = pull in
+				if (event->wheel.y > 0) pushPullFace(app, -1);
+				else if (event->wheel.y < 0) pushPullFace(app, +1);
 			}
 			break;
 		case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -366,7 +370,11 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 		case SDL_EVENT_KEY_DOWN:
 			switch (event->key.key) {
 				case SDLK_ESCAPE: return SDL_APP_SUCCESS;
-				case SDLK_E: app->editMode = !app->editMode; app->selected = -1; break;
+				case SDLK_E:
+					app->editMode = !app->editMode;
+					app->selected = -1;
+					app->selectedFace = -1;
+					break;
 				default: break;
 			}
 			if (app->editMode) {
@@ -457,18 +465,22 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::submit(0, app->program);
 	}
 
-	// Highlight the targeted face (the one the wheel would push/pull).
-	if (app->editMode && app->targeted >= 0 && app->targetedFace >= 0) {
+	// Highlight a face: the selected one (the push/pull target) if any, else the targeted one.
+	const bool haveSel = app->selected >= 0 && app->selectedFace >= 0;
+	const int hiBrush = haveSel ? app->selected : app->targeted;
+	const int hiFace = haveSel ? app->selectedFace : app->targetedFace;
+	if (app->editMode && hiBrush >= 0 && hiFace >= 0 && hiBrush < (int)app->brushes.size()) {
 		std::vector<BrushVertex> tris;
-		buildFaceMesh(app->brushes[app->targeted], (size_t)app->targetedFace, 0.4f, tris);
+		buildFaceMesh(app->brushes[hiBrush], (size_t)hiFace, 0.4f, tris);
 		const uint32_t n = (uint32_t)tris.size();
 		if (n > 0 && bgfx::getAvailTransientVertexBuffer(n, app->layout) >= n) {
 			bgfx::TransientVertexBuffer tvb;
 			bgfx::allocTransientVertexBuffer(&tvb, n, app->layout);
 			memcpy(tvb.data, tris.data(), n * sizeof(BrushVertex));
-			const float hi[4] = {1.0f, 0.9f, 0.35f, 1.0f};
+			const float sel[4] = {1.0f, 0.95f, 0.3f, 1.0f};   // selected: bright
+			const float tgt[4] = {0.55f, 0.6f, 0.75f, 1.0f};  // targeted: subtle
 			bgfx::setVertexBuffer(0, &tvb);
-			bgfx::setUniform(app->u_albedo, hi);
+			bgfx::setUniform(app->u_albedo, haveSel ? sel : tgt);
 			bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_DEPTH_TEST_LEQUAL);
 			bgfx::submit(0, app->program);
 		}
@@ -488,9 +500,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	if (app->editMode) {
 		const uint16_t cols = uint16_t(app->width / 8), rows = uint16_t(app->height / 16);
 		bgfx::dbgTextPrintf(cols / 2, rows / 2, 0x0f, "+");  // crosshair
-		bgfx::dbgTextPrintf(1, 1, 0x0e, "EDIT  grid:%d  brushes:%zu  selected:%d",
-		                    (int)app->gridStep, app->brushes.size(), app->selected);
-		bgfx::dbgTextPrintf(1, 2, 0x0a, "wheel:push/pull face   L-click:select   Enter:new   X/Del:delete");
+		bgfx::dbgTextPrintf(1, 1, 0x0e, "EDIT  grid:%d  brushes:%zu  sel:%d face:%d",
+		                    (int)app->gridStep, app->brushes.size(), app->selected, app->selectedFace);
+		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
 		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  [ ]:grid  Ctrl+Z/Y:undo/redo  E:play");
 	} else {
 		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY (fly)   E:edit   esc:quit");
