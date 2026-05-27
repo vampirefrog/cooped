@@ -70,41 +70,53 @@ bool netIsConnected(NetClient* c) { return c && c->connected; }
 
 #include <emscripten.h>
 
-// JS glue. The server URL comes from the ?server= query param, defaulting to ws://<host>:27501.
+// JS glue. Server URL: ?server=<ws/wss url> if given; else ws://<host>:27501 ONLY on an http
+// page (local dev). On https with no ?server=, stays single-player (a ws:// would be blocked as
+// mixed content). Returns 1 if a connection was started, 0 otherwise. Never throws.
 // Incoming datachannel messages are queued in Module.coopRx (array of Uint8Array); C drains them.
-EM_JS(void, coop_js_connect, (), {
-	Module.coopState = 1;  // 0=disconnected, 1=connecting, 2=connected
-	Module.coopRx = [];
-	var url = (new URLSearchParams(location.search)).get('server')
-	          || ('ws://' + (location.hostname || 'localhost') + ':27501');
-	var ws = new WebSocket(url);
-	var pc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
-	var dc = pc.createDataChannel('data', {ordered: true});
-	dc.binaryType = 'arraybuffer';
-	Module.coopWS = ws; Module.coopPC = pc; Module.coopDC = dc;
+EM_JS(int, coop_js_connect, (), {
+	var server = (new URLSearchParams(location.search)).get('server');
+	var url;
+	if (server) url = server;
+	else if (location.protocol === 'http:') url = 'ws://' + (location.hostname || 'localhost') + ':27501';
+	else return 0;  // https + no ?server= -> single-player (avoid insecure ws:// mixed content)
+	try {
+		Module.coopState = 1;  // 0=disconnected, 1=connecting, 2=connected
+		Module.coopRx = [];
+		var ws = new WebSocket(url);
+		var pc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
+		var dc = pc.createDataChannel('data', {ordered: true});
+		dc.binaryType = 'arraybuffer';
+		Module.coopWS = ws; Module.coopPC = pc; Module.coopDC = dc;
 
-	dc.onopen = function() { Module.coopState = 2; };
-	dc.onclose = function() { Module.coopState = 0; };
-	dc.onmessage = function(e) { Module.coopRx.push(new Uint8Array(e.data)); };
-	pc.onicecandidate = function(e) {
-		if (e.candidate && ws.readyState === 1)
-			ws.send('CAND\n' + (e.candidate.sdpMid || '0') + '\n' + e.candidate.candidate);
-	};
-	ws.onopen = function() {
-		pc.createOffer()
-		  .then(function(o) { return pc.setLocalDescription(o); })
-		  .then(function() { ws.send('offer\n' + pc.localDescription.sdp); });
-	};
-	ws.onmessage = function(ev) {
-		var s = ev.data, nl = s.indexOf('\n'), type = s.substring(0, nl), rest = s.substring(nl + 1);
-		if (type === 'answer') {
-			pc.setRemoteDescription({type: 'answer', sdp: rest});
-		} else if (type === 'CAND') {
-			var nl2 = rest.indexOf('\n');
-			pc.addIceCandidate({candidate: rest.substring(nl2 + 1), sdpMid: rest.substring(0, nl2)});
-		}
-	};
-	ws.onclose = function() { if (Module.coopState !== 2) Module.coopState = 0; };
+		dc.onopen = function() { Module.coopState = 2; };
+		dc.onclose = function() { Module.coopState = 0; };
+		dc.onmessage = function(e) { Module.coopRx.push(new Uint8Array(e.data)); };
+		pc.onicecandidate = function(e) {
+			if (e.candidate && ws.readyState === 1)
+				ws.send('CAND\n' + (e.candidate.sdpMid || '0') + '\n' + e.candidate.candidate);
+		};
+		ws.onopen = function() {
+			pc.createOffer()
+			  .then(function(o) { return pc.setLocalDescription(o); })
+			  .then(function() { ws.send('offer\n' + pc.localDescription.sdp); });
+		};
+		ws.onmessage = function(ev) {
+			var s = ev.data, nl = s.indexOf('\n'), type = s.substring(0, nl), rest = s.substring(nl + 1);
+			if (type === 'answer') {
+				pc.setRemoteDescription({type: 'answer', sdp: rest});
+			} else if (type === 'CAND') {
+				var nl2 = rest.indexOf('\n');
+				pc.addIceCandidate({candidate: rest.substring(nl2 + 1), sdpMid: rest.substring(0, nl2)});
+			}
+		};
+		ws.onerror = function() { if (Module.coopState !== 2) Module.coopState = 0; };
+		ws.onclose = function() { if (Module.coopState !== 2) Module.coopState = 0; };
+		return 1;
+	} catch (e) {
+		Module.coopState = 0;
+		return 0;
+	}
 });
 EM_JS(int, coop_js_state, (), { return Module.coopState || 0; });
 EM_JS(int, coop_js_rxcount, (), { return Module.coopRx ? Module.coopRx.length : 0; });
@@ -122,7 +134,7 @@ struct NetClient {
 bool netGlobalInit() { return true; }
 
 NetClient* netConnect(const char*, uint16_t) {  // URL resolved in JS (query param / default)
-	coop_js_connect();
+	if (coop_js_connect() == 0) return nullptr;  // no server configured -> single-player
 	return new NetClient();
 }
 
