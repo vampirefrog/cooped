@@ -24,17 +24,32 @@ inline bx::Vec3 vat(const std::vector<float>& a, uint32_t i) { return {a[i * 3],
 
 inline uint8_t to8(float v) { return (uint8_t)(bx::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); }
 
+const float kRgbmRange = 8.0f;  // RGBM alpha multiplier range (shader decodes rgb * a * this)
+
 }  // namespace
 
-// RGBM packs an HDR color into RGBA8 (M in alpha scales rgb by kRgbmRange); the shader
-// decodes it. Keeps the lightmap portable to WebGL2 while preserving bright bounced light.
-static const float kRgbmRange = 8.0f;
+// Everything the bounce + assembly need, rebuilt deterministically from the scene on every node.
+struct BakeSolver {
+	uint32_t W = 0, H = 0, chartCount = 0, vertexCount = 0;
+	std::vector<float> lm;         // W*H*3 direct light (base; radiosity overwrites covered texels)
+	std::vector<uint8_t> covered;  // W*H
+	std::vector<float> vertexUV;   // 2 per soup vertex
+	struct Patch { bx::Vec3 pos, nrm, alb; uint32_t ti; };
+	std::vector<Patch> patches;
+	std::vector<bx::Vec3> direct;  // emission per patch (= lm sampled at the patch texel)
+	float patchArea = 0.0f;
+	RTCDevice dev = nullptr;
+	RTCScene scene = nullptr;
+	~BakeSolver() {
+		if (scene) rtcReleaseScene(scene);
+		if (dev) rtcReleaseDevice(dev);
+	}
+};
 
-BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights,
-                         float texelsPerUnit) {
-	const auto tStart = std::chrono::steady_clock::now();
-	// --- gather the world triangle soup (positions + per-vertex face normals) ---
-	std::vector<float> positions, normals, albedos;  // albedos: per-vertex brush color, for color bleed
+BakeSolver* bakeBuild(const std::vector<Brush>& brushes, const std::vector<Light>& lights,
+                      float texelsPerUnit) {
+	// --- gather the world triangle soup (positions + per-vertex face normals + brush albedo) ---
+	std::vector<float> positions, normals, albedos;
 	std::vector<uint32_t> indices;
 	for (const Brush& b : brushes) {
 		std::vector<BrushVertex> verts;
@@ -49,10 +64,9 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 		}
 		for (uint16_t i : idx) indices.push_back(base + (uint32_t)i);
 	}
-	BakeResult r;
-	if (indices.empty()) return r;
+	if (indices.empty()) return nullptr;
 
-	// --- unwrap into a lightmap atlas (xatlas) ---
+	// --- unwrap into a lightmap atlas (xatlas; deterministic for a given input) ---
 	xatlas::Atlas* atlas = xatlas::Create();
 	xatlas::MeshDecl decl;
 	decl.vertexCount = (uint32_t)(positions.size() / 3);
@@ -61,27 +75,28 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 	decl.indexCount = (uint32_t)indices.size();
 	decl.indexData = indices.data();
 	decl.indexFormat = xatlas::IndexFormat::UInt32;
-	if (xatlas::AddMesh(atlas, decl) != xatlas::AddMeshError::Success) { xatlas::Destroy(atlas); return r; }
+	if (xatlas::AddMesh(atlas, decl) != xatlas::AddMeshError::Success) { xatlas::Destroy(atlas); return nullptr; }
 	xatlas::PackOptions packOpts;
-	packOpts.texelsPerUnit = texelsPerUnit;  // density setting (units/texel = 1/this)
+	packOpts.texelsPerUnit = texelsPerUnit;
 	xatlas::Generate(atlas, xatlas::ChartOptions(), packOpts);
 	const uint32_t W = atlas->width, H = atlas->height;
-	if (W == 0 || H == 0 || atlas->meshCount == 0) { xatlas::Destroy(atlas); return r; }
+	if (W == 0 || H == 0 || atlas->meshCount == 0) { xatlas::Destroy(atlas); return nullptr; }
 	const xatlas::Mesh& m = atlas->meshes[0];
 
-	// Per-soup-vertex normalized lightmap UV (last writer wins across chart-duplicated verts).
-	r.vertexCount = (uint32_t)(positions.size() / 3);
-	r.vertexUV.assign(r.vertexCount * 2, 0.0f);
+	BakeSolver* s = new BakeSolver();
+	s->W = W; s->H = H; s->chartCount = atlas->chartCount;
+	s->vertexCount = (uint32_t)(positions.size() / 3);
+	s->vertexUV.assign(s->vertexCount * 2, 0.0f);
 	for (uint32_t i = 0; i < m.vertexCount; ++i) {
 		const xatlas::Vertex& v = m.vertexArray[i];
-		r.vertexUV[v.xref * 2 + 0] = v.uv[0] / (float)W;
-		r.vertexUV[v.xref * 2 + 1] = v.uv[1] / (float)H;
+		s->vertexUV[v.xref * 2 + 0] = v.uv[0] / (float)W;
+		s->vertexUV[v.xref * 2 + 1] = v.uv[1] / (float)H;
 	}
 
-	// --- Embree BVH over the soup (for shadow rays) ---
-	RTCDevice dev = rtcNewDevice(nullptr);
-	RTCScene scene = rtcNewScene(dev);
-	RTCGeometry geom = rtcNewGeometry(dev, RTC_GEOMETRY_TYPE_TRIANGLE);
+	// --- Embree BVH over the soup (shadow + visibility rays) ---
+	s->dev = rtcNewDevice(nullptr);
+	s->scene = rtcNewScene(s->dev);
+	RTCGeometry geom = rtcNewGeometry(s->dev, RTC_GEOMETRY_TYPE_TRIANGLE);
 	const uint32_t nv = (uint32_t)(positions.size() / 3), nt = (uint32_t)(indices.size() / 3);
 	float* vb = (float*)rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3,
 	                                            3 * sizeof(float), nv);
@@ -90,27 +105,25 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 	                                                  3 * sizeof(unsigned), nt);
 	memcpy(ib, indices.data(), indices.size() * sizeof(uint32_t));
 	rtcCommitGeometry(geom);
-	rtcAttachGeometry(scene, geom);
+	rtcAttachGeometry(s->scene, geom);
 	rtcReleaseGeometry(geom);
-	rtcCommitScene(scene);
+	rtcCommitScene(s->scene);
 
 	auto occluded = [&](const bx::Vec3& o, const bx::Vec3& d, float dist) -> bool {
 		RTCRay ray{};
 		ray.org_x = o.x; ray.org_y = o.y; ray.org_z = o.z;
 		ray.dir_x = d.x; ray.dir_y = d.y; ray.dir_z = d.z;
 		ray.tnear = 0.05f; ray.tfar = dist; ray.mask = 0xffffffffu;
-		rtcOccluded1(scene, &ray);
+		rtcOccluded1(s->scene, &ray);
 		return ray.tfar < 0.0f;
 	};
 
-	// --- bake constants ---
+	// --- rasterize shadowed direct light per texel ---
 	const bx::Vec3 sunDir = bx::normalize(bx::Vec3(0.35f, 0.25f, 0.9f));
 	const float sunInt = 0.8f;
 	const bx::Vec3 skyAmbient(0.20f, 0.24f, 0.32f);
-
-	std::vector<float> lm(W * H * 3, 0.0f);
-	std::vector<uint8_t> covered(W * H, 0);
-	// Per-texel world attributes captured during rasterization, used by the indirect bounce.
+	s->lm.assign(W * H * 3, 0.0f);
+	s->covered.assign(W * H, 0);
 	std::vector<float> tpos(W * H * 3, 0.0f), tnrm(W * H * 3, 0.0f), talb(W * H * 3, 0.0f);
 
 	for (uint32_t t = 0; t + 2 < m.indexCount; t += 3) {
@@ -154,95 +167,106 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 					}
 				}
 				const int o = (ty * (int)W + tx) * 3;
-				lm[o] = col.x; lm[o + 1] = col.y; lm[o + 2] = col.z;
+				s->lm[o] = col.x; s->lm[o + 1] = col.y; s->lm[o + 2] = col.z;
 				tpos[o] = wp.x; tpos[o + 1] = wp.y; tpos[o + 2] = wp.z;
 				tnrm[o] = n.x;  tnrm[o + 1] = n.y;  tnrm[o + 2] = n.z;
 				talb[o] = alb.x; talb[o + 1] = alb.y; talb[o + 2] = alb.z;
-				covered[ty * W + tx] = 1;
+				s->covered[ty * W + tx] = 1;
 			}
 	}
 
-	// --- indirect bounce: patch-to-patch radiosity (gather form factors with visibility;
-	// no hemicubes, per DESIGN). Each covered texel is a patch; bounce light between them. ---
-	{
-		struct Patch { bx::Vec3 pos, nrm, alb; uint32_t ti; };
-		std::vector<Patch> patches;
-		patches.reserve(W * H);
-		for (uint32_t i = 0; i < W * H; ++i) {
-			if (!covered[i]) continue;
-			const uint32_t o = i * 3;
-			patches.push_back({{tpos[o], tpos[o + 1], tpos[o + 2]},
-			                   {tnrm[o], tnrm[o + 1], tnrm[o + 2]},
-			                   {talb[o], talb[o + 1], talb[o + 2]}, i});
-		}
-		const float texel = 1.0f / packOpts.texelsPerUnit;   // world units per texel
-		const float patchArea = texel * texel;               // emitter area in the form factor
-		const float kPi = 3.14159265358979f;
-		std::vector<bx::Vec3> direct(patches.size(), bx::Vec3(0, 0, 0));
-		for (size_t i = 0; i < patches.size(); ++i) {
-			const uint32_t o = patches[i].ti * 3;
-			direct[i] = bx::Vec3(lm[o], lm[o + 1], lm[o + 2]);
-		}
-		std::vector<bx::Vec3> radiosity = direct;  // converges to direct + bounced light
+	// --- patch list + direct emission (one patch per covered texel) ---
+	const float texel = 1.0f / texelsPerUnit;
+	s->patchArea = texel * texel;
+	for (uint32_t i = 0; i < W * H; ++i) {
+		if (!s->covered[i]) continue;
+		const uint32_t o = i * 3;
+		s->patches.push_back({{tpos[o], tpos[o + 1], tpos[o + 2]},
+		                      {tnrm[o], tnrm[o + 1], tnrm[o + 2]},
+		                      {talb[o], talb[o + 1], talb[o + 2]}, i});
+	}
+	s->direct.assign(s->patches.size(), bx::Vec3(0, 0, 0));
+	for (size_t i = 0; i < s->patches.size(); ++i) {
+		const uint32_t o = s->patches[i].ti * 3;
+		s->direct[i] = bx::Vec3(s->lm[o], s->lm[o + 1], s->lm[o + 2]);
+	}
 
-		const int bounces = 2;
-		const size_t P = patches.size();
-		// A receiver patch's gather depends only on the previous round's radiosity, so each
-		// bounce round is an independent parallel-for over patches + a barrier (bulk-synchronous).
-		// This is exactly the unit of work a network bake node would own a contiguous slice of;
-		// here the thread pool is the local executor (rtcOccluded1 is safe to call concurrently).
-		auto gatherRange = [&](size_t lo, size_t hi, std::vector<bx::Vec3>* out) {
-			for (size_t i = lo; i < hi; ++i) {
-				const Patch& pi = patches[i];
-				bx::Vec3 sum(0, 0, 0);
-				for (size_t j = 0; j < P; ++j) {
-					if (j == i) continue;
-					const Patch& pj = patches[j];
-					const bx::Vec3 d = bx::sub(pj.pos, pi.pos);
-					const float dist2 = bx::dot(d, d);
-					if (dist2 < 1.0f) continue;
-					const float dist = bx::sqrt(dist2);
-					const bx::Vec3 dir = bx::mul(d, 1.0f / dist);
-					const float cosi = bx::dot(pi.nrm, dir);
-					if (cosi <= 0.0f) continue;
-					const float cosj = -bx::dot(pj.nrm, dir);
-					if (cosj <= 0.0f) continue;
-					// Disk-approx form factor; +patchArea regularizes the near-field singularity.
-					const float ff = (cosi * cosj) * patchArea / (kPi * dist2 + patchArea);
-					if (ff < 1.0e-5f) continue;
-					const bx::Vec3 o = bx::add(pi.pos, bx::mul(pi.nrm, 0.1f));
-					if (occluded(o, dir, dist - 0.2f)) continue;
-					sum = bx::add(sum, bx::mul(radiosity[j], ff));
-				}
-				(*out)[i] = bx::Vec3(sum.x * pi.alb.x, sum.y * pi.alb.y, sum.z * pi.alb.z);
+	xatlas::Destroy(atlas);
+	return s;
+}
+
+void bakeDestroy(BakeSolver* s) { delete s; }
+
+size_t bakeSolverPatchCount(const BakeSolver* s) { return s ? s->patches.size() : 0; }
+
+void bakeSolverInitRadiosity(const BakeSolver* s, std::vector<float>& rad) {
+	rad.resize(s->patches.size() * 3);
+	for (size_t i = 0; i < s->patches.size(); ++i) {
+		rad[i * 3 + 0] = s->direct[i].x; rad[i * 3 + 1] = s->direct[i].y; rad[i * 3 + 2] = s->direct[i].z;
+	}
+}
+
+void bakeGather(const BakeSolver* s, const float* radIn, size_t P, size_t lo, size_t hi,
+                float* out, unsigned threads) {
+	const float kPi = 3.14159265358979f;
+	// One receiver patch is independent of the others given the previous round's radiosity, so a
+	// range is a clean parallel-for (rtcOccluded1 is safe to call concurrently on a committed scene).
+	const auto work = [&](size_t a, size_t b) {
+		for (size_t i = a; i < b; ++i) {
+			const BakeSolver::Patch& pi = s->patches[i];
+			bx::Vec3 sum(0, 0, 0);
+			for (size_t j = 0; j < P; ++j) {
+				if (j == i) continue;
+				const BakeSolver::Patch& pj = s->patches[j];
+				const bx::Vec3 d = bx::sub(pj.pos, pi.pos);
+				const float dist2 = bx::dot(d, d);
+				if (dist2 < 1.0f) continue;
+				const float dist = bx::sqrt(dist2);
+				const bx::Vec3 dir = bx::mul(d, 1.0f / dist);
+				const float cosi = bx::dot(pi.nrm, dir);
+				if (cosi <= 0.0f) continue;
+				const float cosj = -bx::dot(pj.nrm, dir);
+				if (cosj <= 0.0f) continue;
+				// Disk-approx form factor; +patchArea regularizes the near-field singularity.
+				const float ff = (cosi * cosj) * s->patchArea / (kPi * dist2 + s->patchArea);
+				if (ff < 1.0e-5f) continue;
+				const bx::Vec3 o = bx::add(pi.pos, bx::mul(pi.nrm, 0.1f));
+				RTCRay ray{};
+				ray.org_x = o.x; ray.org_y = o.y; ray.org_z = o.z;
+				ray.dir_x = dir.x; ray.dir_y = dir.y; ray.dir_z = dir.z;
+				ray.tnear = 0.05f; ray.tfar = dist - 0.2f; ray.mask = 0xffffffffu;
+				rtcOccluded1(s->scene, &ray);
+				if (ray.tfar < 0.0f) continue;
+				sum = bx::add(sum, bx::mul(bx::Vec3(radIn[j * 3], radIn[j * 3 + 1], radIn[j * 3 + 2]), ff));
 			}
-		};
-		unsigned hw = bx::max(1u, std::thread::hardware_concurrency());
-		if (const char* e = getenv("COOPED_BAKE_THREADS")) { const int v = atoi(e); if (v > 0) hw = (unsigned)v; }
-		const unsigned nthreads = (P < 512) ? 1u : hw;  // tiny bakes aren't worth the thread overhead
-		for (int pass = 0; pass < bounces; ++pass) {
-			std::vector<bx::Vec3> gathered(P, bx::Vec3(0, 0, 0));
-			std::vector<std::thread> pool;
-			const size_t chunk = (P + nthreads - 1) / nthreads;
-			for (unsigned t = 0; t < nthreads; ++t) {
-				const size_t lo = (size_t)t * chunk, hi = bx::min(P, lo + chunk);
-				if (lo >= hi) break;
-				pool.emplace_back(gatherRange, lo, hi, &gathered);
-			}
-			for (std::thread& th : pool) th.join();
-			for (size_t i = 0; i < P; ++i) radiosity[i] = bx::add(direct[i], gathered[i]);
+			const size_t k = (i - lo) * 3;
+			out[k + 0] = sum.x * pi.alb.x; out[k + 1] = sum.y * pi.alb.y; out[k + 2] = sum.z * pi.alb.z;
 		}
-		double bounced = 0.0;
-		for (size_t i = 0; i < patches.size(); ++i) {
-			const uint32_t o = patches[i].ti * 3;
-			bounced += bx::length(bx::sub(radiosity[i], direct[i]));
-			lm[o] = radiosity[i].x; lm[o + 1] = radiosity[i].y; lm[o + 2] = radiosity[i].z;
-		}
-		printf("[bake] radiosity: %zu patches, %d bounces, %u threads, avg indirect %.3f\n",
-		       patches.size(), bounces, nthreads, patches.empty() ? 0.0 : bounced / patches.size());
+	};
+	const size_t N = hi - lo;
+	const unsigned nthreads = (N < 512) ? 1u : bx::max(1u, threads);
+	if (nthreads <= 1) { work(lo, hi); return; }
+	std::vector<std::thread> pool;
+	const size_t chunk = (N + nthreads - 1) / nthreads;
+	for (unsigned t = 0; t < nthreads; ++t) {
+		const size_t a = lo + (size_t)t * chunk, b = bx::min(hi, a + chunk);
+		if (a >= b) break;
+		pool.emplace_back(work, a, b);
+	}
+	for (std::thread& th : pool) th.join();
+}
+
+BakeResult bakeAssemble(const BakeSolver* s, const float* rad, size_t P) {
+	BakeResult r;
+	const uint32_t W = s->W, H = s->H;
+	std::vector<float> lm = s->lm;  // base direct light; overwrite covered texels with final radiosity
+	for (size_t i = 0; i < P && i < s->patches.size(); ++i) {
+		const uint32_t o = s->patches[i].ti * 3;
+		lm[o] = rad[i * 3 + 0]; lm[o + 1] = rad[i * 3 + 1]; lm[o + 2] = rad[i * 3 + 2];
 	}
 
 	// Dilate covered texels into their neighbours a couple of times (reduces chart-edge seams).
+	std::vector<uint8_t> covered = s->covered;
 	for (int pass = 0; pass < 2; ++pass) {
 		std::vector<uint8_t> cov2 = covered;
 		for (int y = 0; y < (int)H; ++y)
@@ -252,8 +276,8 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 				for (auto& d : nb) {
 					const int nx = x + d[0], ny = y + d[1];
 					if (nx < 0 || ny < 0 || nx >= (int)W || ny >= (int)H || !covered[ny * W + nx]) continue;
-					const int s = (ny * W + nx) * 3, o = (y * W + x) * 3;
-					lm[o] = lm[s]; lm[o + 1] = lm[s + 1]; lm[o + 2] = lm[s + 2];
+					const int so = (ny * W + nx) * 3, o = (y * W + x) * 3;
+					lm[o] = lm[so]; lm[o + 1] = lm[so + 1]; lm[o + 2] = lm[so + 2];
 					cov2[y * W + x] = 1;
 					break;
 				}
@@ -261,28 +285,55 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 		covered.swap(cov2);
 	}
 
-	// Encode the HDR lightmap as RGBM (RGBA8). The shader decodes and tonemaps at display
-	// time, so bounced/bright light isn't clipped here the way an LDR bake would clip it.
+	// RGBM encode (shader decodes + tonemaps, so bright/bounced light isn't clipped here).
 	r.pixels.resize(W * H * 4);
 	for (uint32_t i = 0; i < W * H; ++i) {
 		const float rr = lm[i * 3 + 0], gg = lm[i * 3 + 1], bb = lm[i * 3 + 2];
-		float m = bx::max(bx::max(rr, gg, bb) / kRgbmRange, 1.0f / 255.0f);
-		m = bx::ceil(bx::clamp(m, 0.0f, 1.0f) * 255.0f) / 255.0f;  // round M up so rgb/M stays <= 1
-		const float inv = 1.0f / (m * kRgbmRange);
+		float mm = bx::max(bx::max(rr, gg, bb) / kRgbmRange, 1.0f / 255.0f);
+		mm = bx::ceil(bx::clamp(mm, 0.0f, 1.0f) * 255.0f) / 255.0f;
+		const float inv = 1.0f / (mm * kRgbmRange);
 		r.pixels[i * 4 + 0] = to8(rr * inv);
 		r.pixels[i * 4 + 1] = to8(gg * inv);
 		r.pixels[i * 4 + 2] = to8(bb * inv);
-		r.pixels[i * 4 + 3] = to8(m);
+		r.pixels[i * 4 + 3] = to8(mm);
 	}
-
-	rtcReleaseScene(scene);
-	rtcReleaseDevice(dev);
+	r.vertexUV = s->vertexUV;
+	r.vertexCount = s->vertexCount;
 	r.ok = true;
 	r.atlasWidth = W;
 	r.atlasHeight = H;
-	r.chartCount = atlas->chartCount;
+	r.chartCount = s->chartCount;
+	return r;
+}
+
+BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights,
+                         float texelsPerUnit) {
+	const auto tStart = std::chrono::steady_clock::now();
+	BakeSolver* s = bakeBuild(brushes, lights, texelsPerUnit);
+	if (!s) return {};
+	const size_t P = bakeSolverPatchCount(s);
+
+	unsigned hw = bx::max(1u, std::thread::hardware_concurrency());
+	if (const char* e = getenv("COOPED_BAKE_THREADS")) { const int v = atoi(e); if (v > 0) hw = (unsigned)v; }
+
+	std::vector<float> rad; bakeSolverInitRadiosity(s, rad);
+	const std::vector<float> direct = rad;
+	for (int pass = 0; pass < kBakeBounces; ++pass) {
+		std::vector<float> gathered(P * 3, 0.0f);
+		bakeGather(s, rad.data(), P, 0, P, gathered.data(), hw);
+		for (size_t i = 0; i < P * 3; ++i) rad[i] = direct[i] + gathered[i];
+	}
+
+	double bounced = 0.0;
+	for (size_t i = 0; i < P; ++i)
+		bounced += bx::length(bx::sub(bx::Vec3(rad[i * 3], rad[i * 3 + 1], rad[i * 3 + 2]),
+		                              bx::Vec3(direct[i * 3], direct[i * 3 + 1], direct[i * 3 + 2])));
+	printf("[bake] radiosity: %zu patches, %d bounces, %u threads, avg indirect %.3f\n",
+	       P, kBakeBounces, (P < 512 ? 1u : hw), P ? bounced / P : 0.0);
+
+	BakeResult r = bakeAssemble(s, rad.data(), P);
 	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count();
-	printf("[bake] %u charts, lightmap %u x %u, %zu lights, %.0f ms\n", atlas->chartCount, W, H, lights.size(), ms);
-	xatlas::Destroy(atlas);
+	printf("[bake] %u charts, lightmap %u x %u, %zu lights, %.0f ms\n", r.chartCount, r.atlasWidth, r.atlasHeight, lights.size(), ms);
+	bakeDestroy(s);
 	return r;
 }

@@ -187,6 +187,21 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(cooped_server PRIVATE bx enet LibDataChannel::LibDataChannel)
 endif()
 
+# ---------------------------------------------------------------------------
+# Headless distributed lightmap baker (native only): no renderer. Worker + coordinator.
+# ---------------------------------------------------------------------------
+if(NOT EMSCRIPTEN)
+  add_executable(cooped_bake
+    src/bake_main.cpp
+    src/bake.cpp
+    src/brush.cpp
+    ${xatlas_SOURCE_DIR}/source/xatlas/xatlas.cpp
+  )
+  target_include_directories(cooped_bake PRIVATE src ${enet_SOURCE_DIR}/include
+                             ${xatlas_SOURCE_DIR}/source/xatlas ${embree_SOURCE_DIR}/include)
+  target_link_libraries(cooped_bake PRIVATE bx enet embree)
+endif()
+
 # SDL3 exposes SDL3::SDL3-static when built static; SDL3::SDL3 otherwise.
 if(TARGET SDL3::SDL3-static)
   target_link_libraries(cooped PRIVATE SDL3::SDL3-static)

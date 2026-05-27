@@ -20,6 +20,7 @@
 #include <rtc/rtc.hpp>
 
 #include "brush.h"
+#include "map_io.h"
 #include "protocol.h"
 
 namespace {
@@ -33,55 +34,13 @@ volatile std::sig_atomic_t g_running = 1;   // cleared by SIGINT/SIGTERM for a c
 
 void onSignal(int) { g_running = 0; }
 
-// Persist / restore the authoritative map (reuses the brush wire encoding from protocol.h).
+// Persist / restore the authoritative map (shared CMAP IO; carries the baked lightmap too).
 bool saveMap(const char* path, const std::vector<Brush>& brushes, const std::vector<Light>& lights) {
-	ByteWriter w;
-	w.u8('C'); w.u8('M'); w.u8('A'); w.u8('P');  // magic
-	w.u32(3);                                     // version (3 = adds optional baked lightmap)
-	w.u32(g_nextId);
-	w.u32((uint32_t)brushes.size());
-	for (const Brush& b : brushes) writeBrush(w, b);
-	w.u32((uint32_t)lights.size());
-	for (const Light& l : lights) writeLight(w, l);
-	const bool hasLm = g_lightmap.valid();
-	w.u8(hasLm ? 1 : 0);
-	if (hasLm) writeLightmap(w, g_lightmap);
-	FILE* f = fopen(path, "wb");
-	if (!f) return false;
-	const bool ok = fwrite(w.data.data(), 1, w.data.size(), f) == w.data.size();
-	fclose(f);
-	return ok;
+	return saveCmap(path, brushes, lights, g_lightmap, g_nextId);
 }
 
 bool loadMap(const char* path, std::vector<Brush>& brushes, std::vector<Light>& lights) {
-	FILE* f = fopen(path, "rb");
-	if (!f) return false;
-	fseek(f, 0, SEEK_END);
-	const long size = ftell(f);
-	fseek(f, 0, SEEK_SET);
-	std::vector<uint8_t> buf(size > 0 ? (size_t)size : 0);
-	const size_t got = buf.empty() ? 0 : fread(buf.data(), 1, buf.size(), f);
-	fclose(f);
-	if (got != buf.size() || buf.size() < 16) return false;
-	ByteReader r(buf.data(), buf.size());
-	if (r.u8() != 'C' || r.u8() != 'M' || r.u8() != 'A' || r.u8() != 'P') return false;
-	const uint32_t version = r.u32();
-	g_nextId = r.u32();
-	const uint32_t n = r.u32();
-	std::vector<Brush> loaded;
-	for (uint32_t i = 0; i < n && r.ok; ++i) loaded.push_back(readBrush(r));
-	if (!r.ok || loaded.size() != n) return false;
-	const uint32_t ln = r.u32();
-	std::vector<Light> loadedLights;
-	for (uint32_t i = 0; i < ln && r.ok; ++i) loadedLights.push_back(readLight(r));
-	if (!r.ok || loadedLights.size() != ln) return false;
-	if (version >= 3 && r.u8() == 1) {   // optional baked lightmap
-		LightmapData lm = readLightmap(r);
-		if (r.ok && lm.valid()) g_lightmap = std::move(lm);
-	}
-	brushes = std::move(loaded);
-	lights = std::move(loadedLights);
-	return true;
+	return loadCmap(path, brushes, lights, g_lightmap, g_nextId);
 }
 
 // --- WebRTC peer registry + a thread-safe inbound queue (libdatachannel callbacks run on
@@ -420,7 +379,7 @@ int main(int argc, char** argv) {
 	if (loadMap(mapPath, brushes, lights))
 		printf("loaded map '%s' (%zu brushes, %zu lights)\n", mapPath, brushes.size(), lights.size());
 	else
-		buildScene(brushes);
+		{ buildScene(brushes); g_dirty = true; }  // persist the fresh sandbox so tools can bake it
 
 	std::signal(SIGINT, onSignal);
 	std::signal(SIGTERM, onSignal);
