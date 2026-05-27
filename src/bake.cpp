@@ -29,7 +29,7 @@ inline uint8_t tonemap(float v) {  // exposure tonemap -> 8-bit
 
 BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights) {
 	// --- gather the world triangle soup (positions + per-vertex face normals) ---
-	std::vector<float> positions, normals;
+	std::vector<float> positions, normals, albedos;  // albedos: per-vertex brush color, for color bleed
 	std::vector<uint32_t> indices;
 	for (const Brush& b : brushes) {
 		std::vector<BrushVertex> verts;
@@ -40,6 +40,7 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 		for (const BrushVertex& v : verts) {
 			positions.push_back(v.x);  positions.push_back(v.y);  positions.push_back(v.z);
 			normals.push_back(v.nx);   normals.push_back(v.ny);   normals.push_back(v.nz);
+			albedos.push_back(b.color[0]); albedos.push_back(b.color[1]); albedos.push_back(b.color[2]);
 		}
 		for (uint16_t i : idx) indices.push_back(base + (uint32_t)i);
 	}
@@ -104,6 +105,8 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 
 	std::vector<float> lm(W * H * 3, 0.0f);
 	std::vector<uint8_t> covered(W * H, 0);
+	// Per-texel world attributes captured during rasterization, used by the indirect bounce.
+	std::vector<float> tpos(W * H * 3, 0.0f), tnrm(W * H * 3, 0.0f), talb(W * H * 3, 0.0f);
 
 	for (uint32_t t = 0; t + 2 < m.indexCount; t += 3) {
 		const xatlas::Vertex& a = m.vertexArray[m.indexArray[t]];
@@ -111,6 +114,7 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 		const xatlas::Vertex& c = m.vertexArray[m.indexArray[t + 2]];
 		const bx::Vec3 w0 = vat(positions, a.xref), w1 = vat(positions, b.xref), w2 = vat(positions, c.xref);
 		const bx::Vec3 n = bx::normalize(vat(normals, a.xref));
+		const bx::Vec3 alb = vat(albedos, a.xref);
 		const float area = edge(a.uv[0], a.uv[1], b.uv[0], b.uv[1], c.uv[0], c.uv[1]);
 		if (bx::abs(area) < 1.0e-6f) continue;
 		int minx = (int)bx::floor(bx::min(a.uv[0], b.uv[0], c.uv[0])), maxx = (int)bx::ceil(bx::max(a.uv[0], b.uv[0], c.uv[0]));
@@ -146,8 +150,74 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 				}
 				const int o = (ty * (int)W + tx) * 3;
 				lm[o] = col.x; lm[o + 1] = col.y; lm[o + 2] = col.z;
+				tpos[o] = wp.x; tpos[o + 1] = wp.y; tpos[o + 2] = wp.z;
+				tnrm[o] = n.x;  tnrm[o + 1] = n.y;  tnrm[o + 2] = n.z;
+				talb[o] = alb.x; talb[o + 1] = alb.y; talb[o + 2] = alb.z;
 				covered[ty * W + tx] = 1;
 			}
+	}
+
+	// --- indirect bounce: patch-to-patch radiosity (gather form factors with visibility;
+	// no hemicubes, per DESIGN). Each covered texel is a patch; bounce light between them. ---
+	{
+		struct Patch { bx::Vec3 pos, nrm, alb; uint32_t ti; };
+		std::vector<Patch> patches;
+		patches.reserve(W * H);
+		for (uint32_t i = 0; i < W * H; ++i) {
+			if (!covered[i]) continue;
+			const uint32_t o = i * 3;
+			patches.push_back({{tpos[o], tpos[o + 1], tpos[o + 2]},
+			                   {tnrm[o], tnrm[o + 1], tnrm[o + 2]},
+			                   {talb[o], talb[o + 1], talb[o + 2]}, i});
+		}
+		const float texel = 1.0f / packOpts.texelsPerUnit;   // world units per texel
+		const float patchArea = texel * texel;               // emitter area in the form factor
+		const float kPi = 3.14159265358979f;
+		std::vector<bx::Vec3> direct(patches.size(), bx::Vec3(0, 0, 0));
+		for (size_t i = 0; i < patches.size(); ++i) {
+			const uint32_t o = patches[i].ti * 3;
+			direct[i] = bx::Vec3(lm[o], lm[o + 1], lm[o + 2]);
+		}
+		std::vector<bx::Vec3> radiosity = direct;  // converges to direct + bounced light
+
+		const int bounces = 2;
+		for (int pass = 0; pass < bounces; ++pass) {
+			std::vector<bx::Vec3> gathered(patches.size(), bx::Vec3(0, 0, 0));
+			for (size_t i = 0; i < patches.size(); ++i) {
+				const Patch& pi = patches[i];
+				bx::Vec3 sum(0, 0, 0);
+				for (size_t j = 0; j < patches.size(); ++j) {
+					if (j == i) continue;
+					const Patch& pj = patches[j];
+					const bx::Vec3 d = bx::sub(pj.pos, pi.pos);
+					const float dist2 = bx::dot(d, d);
+					if (dist2 < 1.0f) continue;
+					const float dist = bx::sqrt(dist2);
+					const bx::Vec3 dir = bx::mul(d, 1.0f / dist);
+					const float cosi = bx::dot(pi.nrm, dir);
+					if (cosi <= 0.0f) continue;
+					const float cosj = -bx::dot(pj.nrm, dir);
+					if (cosj <= 0.0f) continue;
+					// Disk-approx form factor; +patchArea regularizes the near-field singularity.
+					const float ff = (cosi * cosj) * patchArea / (kPi * dist2 + patchArea);
+					if (ff < 1.0e-5f) continue;
+					const bx::Vec3 o = bx::add(pi.pos, bx::mul(pi.nrm, 0.1f));
+					if (occluded(o, dir, dist - 0.2f)) continue;
+					sum = bx::add(sum, bx::mul(radiosity[j], ff));
+				}
+				gathered[i] = bx::Vec3(sum.x * pi.alb.x, sum.y * pi.alb.y, sum.z * pi.alb.z);
+			}
+			for (size_t i = 0; i < patches.size(); ++i)
+				radiosity[i] = bx::add(direct[i], gathered[i]);
+		}
+		double bounced = 0.0;
+		for (size_t i = 0; i < patches.size(); ++i) {
+			const uint32_t o = patches[i].ti * 3;
+			bounced += bx::length(bx::sub(radiosity[i], direct[i]));
+			lm[o] = radiosity[i].x; lm[o + 1] = radiosity[i].y; lm[o + 2] = radiosity[i].z;
+		}
+		printf("[bake] radiosity: %zu patches, %d bounces, avg indirect %.3f\n",
+		       patches.size(), bounces, patches.empty() ? 0.0 : bounced / patches.size());
 	}
 
 	// Dilate covered texels into their neighbours a couple of times (reduces chart-edge seams).
