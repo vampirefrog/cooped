@@ -19,13 +19,13 @@ inline float edge(float ax, float ay, float bx_, float by, float cx, float cy) {
 
 inline bx::Vec3 vat(const std::vector<float>& a, uint32_t i) { return {a[i * 3], a[i * 3 + 1], a[i * 3 + 2]}; }
 
-inline uint8_t tonemap(float v) {  // exposure tonemap -> 8-bit
-	const float c = 1.0f - bx::exp(-v * 1.2f);
-	const int i = (int)(bx::clamp(c, 0.0f, 1.0f) * 255.0f + 0.5f);
-	return (uint8_t)i;
-}
+inline uint8_t to8(float v) { return (uint8_t)(bx::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f); }
 
 }  // namespace
+
+// RGBM packs an HDR color into RGBA8 (M in alpha scales rgb by kRgbmRange); the shader
+// decodes it. Keeps the lightmap portable to WebGL2 while preserving bright bounced light.
+static const float kRgbmRange = 8.0f;
 
 BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Light>& lights) {
 	// --- gather the world triangle soup (positions + per-vertex face normals) ---
@@ -239,13 +239,18 @@ BakeResult bakeLightmaps(const std::vector<Brush>& brushes, const std::vector<Li
 		covered.swap(cov2);
 	}
 
-	// Tonemap to an RGBA8 lightmap texture the renderer samples.
+	// Encode the HDR lightmap as RGBM (RGBA8). The shader decodes and tonemaps at display
+	// time, so bounced/bright light isn't clipped here the way an LDR bake would clip it.
 	r.pixels.resize(W * H * 4);
 	for (uint32_t i = 0; i < W * H; ++i) {
-		r.pixels[i * 4 + 0] = tonemap(lm[i * 3 + 0]);
-		r.pixels[i * 4 + 1] = tonemap(lm[i * 3 + 1]);
-		r.pixels[i * 4 + 2] = tonemap(lm[i * 3 + 2]);
-		r.pixels[i * 4 + 3] = 255;
+		const float rr = lm[i * 3 + 0], gg = lm[i * 3 + 1], bb = lm[i * 3 + 2];
+		float m = bx::max(bx::max(rr, gg, bb) / kRgbmRange, 1.0f / 255.0f);
+		m = bx::ceil(bx::clamp(m, 0.0f, 1.0f) * 255.0f) / 255.0f;  // round M up so rgb/M stays <= 1
+		const float inv = 1.0f / (m * kRgbmRange);
+		r.pixels[i * 4 + 0] = to8(rr * inv);
+		r.pixels[i * 4 + 1] = to8(gg * inv);
+		r.pixels[i * 4 + 2] = to8(bb * inv);
+		r.pixels[i * 4 + 3] = to8(m);
 	}
 
 	rtcReleaseScene(scene);

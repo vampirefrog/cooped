@@ -17,7 +17,9 @@ void main()
 	vec3 tex = texture2D(s_tex, v_texcoord0).rgb;
 	vec3 lit;
 	if (u_lightParams.z > 0.5) {
-		lit = texture2D(s_lightmap, v_texcoord1).rgb;  // baked lighting (shadows, GI)
+		vec4 lmv = texture2D(s_lightmap, v_texcoord1);   // RGBM-encoded baked HDR lighting
+		vec3 hdr = lmv.rgb * (lmv.a * 8.0);              // decode (kRgbmRange = 8)
+		lit = vec3_splat(1.0) - exp(-hdr * 1.2);         // exposure tonemap -> LDR
 	} else {
 		vec3 n = normalize(v_normal);
 		lit = vec3_splat(u_lightParams.y);                                       // ambient
