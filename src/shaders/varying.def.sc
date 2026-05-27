@@ -4,3 +4,4 @@ vec2 a_texcoord0 : TEXCOORD0;
 
 vec3 v_normal    : TEXCOORD0;
 vec2 v_texcoord0 : TEXCOORD1;
+vec3 v_wpos      : TEXCOORD2;

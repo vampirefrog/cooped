@@ -12,7 +12,7 @@
 
 // Bump on any wire-format change. The server sends it in AssignId; the client compares and
 // surfaces a clear mismatch instead of silently rendering a garbled map.
-constexpr uint32_t kProtocolVersion = 3;
+constexpr uint32_t kProtocolVersion = 4;
 
 enum class MsgType : uint8_t {
 	Snapshot       = 1,  // server->client: full map
@@ -25,6 +25,8 @@ enum class MsgType : uint8_t {
 	PlayerStates   = 8,  // server->clients: [count]{id,pos,yaw,pitch} of everyone
 	SetFaceTexture = 9,  // brush id + face index + texture index
 	SetFaceUV      = 10, // brush id + face index + uScale,vScale,uOffset,vOffset,rotation
+	CreateLight    = 11, // client: pos+color+radius (id=0); server: with assigned id
+	DeleteLight    = 12, // light id
 };
 
 struct ByteWriter {
@@ -74,11 +76,44 @@ inline Brush readBrush(ByteReader& r) {
 	return b;
 }
 
-inline std::vector<uint8_t> msgSnapshot(const std::vector<Brush>& brushes) {
+inline void writeLight(ByteWriter& w, const Light& l) {
+	w.u32(l.id);
+	w.vec3(l.pos);
+	w.f32(l.color[0]); w.f32(l.color[1]); w.f32(l.color[2]);
+	w.f32(l.radius);
+}
+
+inline Light readLight(ByteReader& r) {
+	Light l;
+	l.id = r.u32();
+	l.pos = r.vec3();
+	l.color[0] = r.f32(); l.color[1] = r.f32(); l.color[2] = r.f32();
+	l.radius = r.f32();
+	return l;
+}
+
+inline std::vector<uint8_t> msgSnapshot(const std::vector<Brush>& brushes,
+                                        const std::vector<Light>& lights) {
 	ByteWriter w;
 	w.u8((uint8_t)MsgType::Snapshot);
 	w.u32((uint32_t)brushes.size());
 	for (const Brush& b : brushes) writeBrush(w, b);
+	w.u32((uint32_t)lights.size());
+	for (const Light& l : lights) writeLight(w, l);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgCreateLight(const Light& l) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::CreateLight);
+	writeLight(w, l);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgDeleteLight(uint32_t id) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::DeleteLight);
+	w.u32(id);
 	return w.data;
 }
 

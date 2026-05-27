@@ -34,6 +34,14 @@ struct Brush {
 	float color[3] = {0.8f, 0.8f, 0.8f};
 };
 
+// A dynamic point light (map entity).
+struct Light {
+	uint32_t id = 0;
+	bx::Vec3 pos = bx::Vec3(0, 0, 0);
+	float color[3] = {1.0f, 1.0f, 1.0f};
+	float radius = 384.0f;
+};
+
 // Index range for one face's triangles within a brush mesh (for per-face texture binding).
 struct FaceRange {
 	uint32_t firstIndex;

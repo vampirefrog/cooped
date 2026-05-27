@@ -36,6 +36,9 @@
 namespace {
 
 constexpr float kGridExtent = 2048.0f;  // half-size of the rendered grid
+constexpr int   kMaxLights  = 32;        // must match fs_world.sc
+const float kPlaceColors[5][3] = {
+    {1.0f, 1.0f, 1.0f}, {1.0f, 0.4f, 0.3f}, {0.4f, 1.0f, 0.5f}, {0.5f, 0.6f, 1.0f}, {1.0f, 0.85f, 0.5f}};
 
 // Player physics constants (Quake-scale units).
 const bx::Vec3 kPlayerHalf(16.0f, 16.0f, 28.0f);  // 32 x 32 x 56 AABB
@@ -137,6 +140,14 @@ struct App {
 	bgfx::UniformHandle s_tex = BGFX_INVALID_HANDLE;
 	std::vector<bgfx::TextureHandle> textures;            // loaded texture set
 	bgfx::TextureHandle whiteTex = BGFX_INVALID_HANDLE;   // 1x1 white (untextured draws)
+	// Lighting uniforms.
+	bgfx::UniformHandle u_lightParams = BGFX_INVALID_HANDLE;     // x=count, y=ambient
+	bgfx::UniformHandle u_sunDir = BGFX_INVALID_HANDLE;          // xyz dir, w intensity
+	bgfx::UniformHandle u_lightPosRadius = BGFX_INVALID_HANDLE;  // [kMaxLights] xyz+radius
+	bgfx::UniformHandle u_lightColor = BGFX_INVALID_HANDLE;      // [kMaxLights] rgb+intensity
+	std::vector<Light> lights;
+	Mesh lightMarker;                                           // small cube drawn at each light
+	int placeColorIdx = 0;                                      // current light color to place
 
 	std::vector<Brush> brushes;   // source of truth
 	std::vector<Mesh>  meshes;    // rebuilt from brushes when dirty
@@ -408,6 +419,64 @@ void setFaceUV(App* app, float us, float vs, float uo, float vo, float rot) {
 	app->meshes[bi] = buildMeshFromBrush(app->brushes[bi], app->layout);  // UVs are baked in
 }
 
+// Place a point light above the crosshair's ground point (synced when online).
+void createLight(App* app) {
+	bx::Vec3 g(0.0f, 0.0f, 0.0f);
+	if (!aimGroundPoint(app, app->cam.forward(), g)) return;
+	Light l;
+	l.pos = bx::add(g, bx::Vec3(0.0f, 0.0f, 128.0f));
+	l.color[0] = kPlaceColors[app->placeColorIdx][0];
+	l.color[1] = kPlaceColors[app->placeColorIdx][1];
+	l.color[2] = kPlaceColors[app->placeColorIdx][2];
+	l.radius = 384.0f;
+	if (app->online) { sendMsg(app, msgCreateLight(l)); return; }
+	l.id = app->localNextId++;
+	app->lights.push_back(l);
+}
+
+// Delete the light nearest the crosshair ray (synced when online).
+void deleteNearestLight(App* app) {
+	const bx::Vec3 ro = app->cam.pos, rd = app->cam.forward();
+	int best = -1;
+	float bestPerp = 96.0f;  // must be within this distance of the aim ray
+	for (int i = 0; i < (int)app->lights.size(); ++i) {
+		const float t = bx::dot(bx::sub(app->lights[i].pos, ro), rd);
+		if (t <= 0.0f) continue;
+		const float perp = bx::length(bx::sub(app->lights[i].pos, bx::add(ro, bx::mul(rd, t))));
+		if (perp < bestPerp) { bestPerp = perp; best = i; }
+	}
+	if (best < 0) return;
+	const uint32_t id = app->lights[best].id;
+	if (app->online) { sendMsg(app, msgDeleteLight(id)); return; }
+	app->lights.erase(app->lights.begin() + best);
+}
+
+// Light uniforms: real lighting for brushes, flat (ambient=1) for unlit overlays/markers.
+void setBrushLighting(App* app) {
+	const int n = (int)app->lights.size() > kMaxLights ? kMaxLights : (int)app->lights.size();
+	const float lp[4] = {(float)n, 0.15f, 0.0f, 0.0f};
+	const bx::Vec3 sd = bx::normalize(bx::Vec3(0.35f, 0.25f, 0.9f));
+	const float sun[4] = {sd.x, sd.y, sd.z, 0.6f};
+	bgfx::setUniform(app->u_lightParams, lp);
+	bgfx::setUniform(app->u_sunDir, sun);
+	float posR[kMaxLights * 4] = {0};
+	float col[kMaxLights * 4] = {0};
+	for (int i = 0; i < n; ++i) {
+		const Light& L = app->lights[i];
+		posR[i * 4 + 0] = L.pos.x; posR[i * 4 + 1] = L.pos.y; posR[i * 4 + 2] = L.pos.z; posR[i * 4 + 3] = L.radius;
+		col[i * 4 + 0] = L.color[0]; col[i * 4 + 1] = L.color[1]; col[i * 4 + 2] = L.color[2]; col[i * 4 + 3] = 1.0f;
+	}
+	bgfx::setUniform(app->u_lightPosRadius, posR, n > 0 ? n : 1);
+	bgfx::setUniform(app->u_lightColor, col, n > 0 ? n : 1);
+}
+
+void setFlatLighting(App* app) {
+	const float lp[4] = {0.0f, 1.0f, 0.0f, 0.0f};  // no point lights, full ambient -> flat albedo
+	const float sun[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+	bgfx::setUniform(app->u_lightParams, lp);
+	bgfx::setUniform(app->u_sunDir, sun);
+}
+
 // Apply a message received from the server to the local map.
 void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 	ByteReader r(data, len);
@@ -416,9 +485,24 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			const uint32_t n = r.u32();
 			app->brushes.clear();
 			for (uint32_t i = 0; i < n && r.ok; ++i) app->brushes.push_back(readBrush(r));
+			const uint32_t ln = r.u32();
+			app->lights.clear();
+			for (uint32_t i = 0; i < ln && r.ok; ++i) app->lights.push_back(readLight(r));
 			app->selectedId = 0;
 			app->selectedFace = -1;
 			rebuildSceneMeshes(app);
+			break;
+		}
+		case MsgType::CreateLight: {
+			Light l = readLight(r);
+			if (r.ok) app->lights.push_back(l);
+			break;
+		}
+		case MsgType::DeleteLight: {
+			const uint32_t id = r.u32();
+			if (r.ok)
+				for (size_t i = 0; i < app->lights.size(); ++i)
+					if (app->lights[i].id == id) { app->lights.erase(app->lights.begin() + i); break; }
 			break;
 		}
 		case MsgType::CreateBrush: {
@@ -620,6 +704,11 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 	app->program = createWorldProgram();
 	app->u_albedo = bgfx::createUniform("u_albedo", bgfx::UniformType::Vec4);
 	app->s_tex = bgfx::createUniform("s_tex", bgfx::UniformType::Sampler);
+	app->u_lightParams = bgfx::createUniform("u_lightParams", bgfx::UniformType::Vec4);
+	app->u_sunDir = bgfx::createUniform("u_sunDir", bgfx::UniformType::Vec4);
+	app->u_lightPosRadius = bgfx::createUniform("u_lightPosRadius", bgfx::UniformType::Vec4, kMaxLights);
+	app->u_lightColor = bgfx::createUniform("u_lightColor", bgfx::UniformType::Vec4, kMaxLights);
+	app->lightMarker = buildMeshFromBrush(makeBox({0, 0, 0}, {8, 8, 8}, 1, 1, 1), app->layout);
 
 	const uint32_t whitePixel = 0xffffffff;
 	app->whiteTex = bgfx::createTexture2D(1, 1, false, 1, bgfx::TextureFormat::RGBA8, 0,
@@ -720,6 +809,9 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 					switch (event->key.key) {
 						case SDLK_RETURN: createBrushAtAim(app); break;
 						case SDLK_T: cycleTexture(app); break;
+						case SDLK_L: createLight(app); break;
+						case SDLK_K: deleteNearestLight(app); break;
+						case SDLK_C: app->placeColorIdx = (app->placeColorIdx + 1) % 5; break;
 						case SDLK_DELETE:
 						case SDLK_X: deleteSelected(app); break;
 						// Arrows: Shift = UV offset on the selected face, else move the brush.
@@ -841,6 +933,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	const uint64_t triState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_WRITE_Z |
 	                          BGFX_STATE_DEPTH_TEST_LESS;
 	const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+	setBrushLighting(app);  // ambient + sun + point lights, for the brush draws
 	for (int i = 0; i < (int)app->meshes.size(); ++i) {
 		const Mesh& m = app->meshes[i];
 		if (!bgfx::isValid(m.vbh)) continue;
@@ -852,6 +945,24 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			bgfx::setVertexBuffer(0, m.vbh);
 			bgfx::setIndexBuffer(m.ibh, fr.firstIndex, fr.numIndices);
 			bgfx::setUniform(app->u_albedo, white);
+			bgfx::setState(triState);
+			bgfx::submit(0, app->program);
+		}
+	}
+
+	setFlatLighting(app);  // overlays/markers below render unlit (flat albedo)
+
+	// Light markers: a small emissive cube at each light, in its color.
+	if (app->editMode && bgfx::isValid(app->lightMarker.vbh)) {
+		for (const Light& l : app->lights) {
+			float mtx[16];
+			bx::mtxTranslate(mtx, l.pos.x, l.pos.y, l.pos.z);
+			const float col[4] = {l.color[0], l.color[1], l.color[2], 1.0f};
+			bgfx::setTransform(mtx);
+			bgfx::setTexture(0, app->s_tex, app->whiteTex);
+			bgfx::setVertexBuffer(0, app->lightMarker.vbh);
+			bgfx::setIndexBuffer(app->lightMarker.ibh);
+			bgfx::setUniform(app->u_albedo, col);
 			bgfx::setState(triState);
 			bgfx::submit(0, app->program);
 		}
@@ -936,6 +1047,8 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::dbgTextPrintf(1, 2, 0x0a, "L-click:select face   wheel:push(up)/pull(down)   Enter:new   X/Del:delete");
 		bgfx::dbgTextPrintf(1, 3, 0x0a, "arrows/PgUp/PgDn:move  G+wheel:grid  T:texture  Ctrl+Z/Y:undo  E:play");
 		bgfx::dbgTextPrintf(1, 4, 0x09, "face UV:  [ ]:scale  , .:rotate  shift+arrows:offset  \\:reset");
+		bgfx::dbgTextPrintf(1, 6, 0x0d, "lights:  L:place  K:delete nearest  C:color (%d)  |  count:%zu",
+		                    app->placeColorIdx, app->lights.size());
 	} else {
 		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   E:edit   esc:quit",
 		                    app->onGround ? "[grounded]" : "[airborne]");
@@ -955,6 +1068,9 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		for (Mesh& m : app->meshes) m.destroy();
 		app->grid.destroy();
 		app->avatarMesh.destroy();
+		app->lightMarker.destroy();
+		for (bgfx::UniformHandle u : {app->u_lightParams, app->u_sunDir, app->u_lightPosRadius, app->u_lightColor})
+			if (bgfx::isValid(u)) bgfx::destroy(u);
 		for (bgfx::TextureHandle t : app->textures)
 			if (bgfx::isValid(t) && t.idx != app->whiteTex.idx) bgfx::destroy(t);
 		if (bgfx::isValid(app->whiteTex)) bgfx::destroy(app->whiteTex);

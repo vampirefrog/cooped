@@ -33,13 +33,15 @@ volatile std::sig_atomic_t g_running = 1;   // cleared by SIGINT/SIGTERM for a c
 void onSignal(int) { g_running = 0; }
 
 // Persist / restore the authoritative map (reuses the brush wire encoding from protocol.h).
-bool saveMap(const char* path, const std::vector<Brush>& brushes) {
+bool saveMap(const char* path, const std::vector<Brush>& brushes, const std::vector<Light>& lights) {
 	ByteWriter w;
 	w.u8('C'); w.u8('M'); w.u8('A'); w.u8('P');  // magic
-	w.u32(1);                                     // version
+	w.u32(2);                                     // version
 	w.u32(g_nextId);
 	w.u32((uint32_t)brushes.size());
 	for (const Brush& b : brushes) writeBrush(w, b);
+	w.u32((uint32_t)lights.size());
+	for (const Light& l : lights) writeLight(w, l);
 	FILE* f = fopen(path, "wb");
 	if (!f) return false;
 	const bool ok = fwrite(w.data.data(), 1, w.data.size(), f) == w.data.size();
@@ -47,7 +49,7 @@ bool saveMap(const char* path, const std::vector<Brush>& brushes) {
 	return ok;
 }
 
-bool loadMap(const char* path, std::vector<Brush>& brushes) {
+bool loadMap(const char* path, std::vector<Brush>& brushes, std::vector<Light>& lights) {
 	FILE* f = fopen(path, "rb");
 	if (!f) return false;
 	fseek(f, 0, SEEK_END);
@@ -65,7 +67,12 @@ bool loadMap(const char* path, std::vector<Brush>& brushes) {
 	std::vector<Brush> loaded;
 	for (uint32_t i = 0; i < n && r.ok; ++i) loaded.push_back(readBrush(r));
 	if (!r.ok || loaded.size() != n) return false;
+	const uint32_t ln = r.u32();
+	std::vector<Light> loadedLights;
+	for (uint32_t i = 0; i < ln && r.ok; ++i) loadedLights.push_back(readLight(r));
+	if (!r.ok || loadedLights.size() != ln) return false;
 	brushes = std::move(loaded);
+	lights = std::move(loadedLights);
 	return true;
 }
 
@@ -124,9 +131,24 @@ void broadcastAll(ENetHost* host, const std::vector<uint8_t>& msg) {
 }
 
 // Apply an op to the authoritative map; returns the message to rebroadcast (empty if invalid).
-std::vector<uint8_t> applyOp(std::vector<Brush>& brushes, const uint8_t* data, size_t len) {
+std::vector<uint8_t> applyOp(std::vector<Brush>& brushes, std::vector<Light>& lights,
+                             const uint8_t* data, size_t len) {
 	ByteReader r(data, len);
 	switch ((MsgType)r.u8()) {
+		case MsgType::CreateLight: {
+			Light l = readLight(r);
+			if (!r.ok) return {};
+			l.id = g_nextId++;
+			lights.push_back(l);
+			return msgCreateLight(l);
+		}
+		case MsgType::DeleteLight: {
+			const uint32_t id = r.u32();
+			if (!r.ok) return {};
+			for (size_t i = 0; i < lights.size(); ++i)
+				if (lights[i].id == id) { lights.erase(lights.begin() + i); break; }
+			return msgDeleteLight(id);
+		}
 		case MsgType::CreateBrush: {
 			Brush b = readBrush(r);
 			if (!r.ok) return {};
@@ -189,8 +211,8 @@ void sendENet(ENetPeer* peer, const std::vector<uint8_t>& msg) {
 
 // Dispatch a message from a client: player-state updates the presence map; everything else is
 // an edit op (applied + rebroadcast). `senderId` is the sender's assigned player id.
-void handleClientMessage(std::vector<Brush>& brushes, uint32_t senderId, const uint8_t* data,
-                         size_t len, ENetHost* host) {
+void handleClientMessage(std::vector<Brush>& brushes, std::vector<Light>& lights, uint32_t senderId,
+                         const uint8_t* data, size_t len, ENetHost* host) {
 	if (len < 1) return;
 	if ((MsgType)data[0] == MsgType::PlayerState) {
 		ByteReader r(data, len);
@@ -207,7 +229,7 @@ void handleClientMessage(std::vector<Brush>& brushes, uint32_t senderId, const u
 		}
 		return;
 	}
-	const std::vector<uint8_t> rb = applyOp(brushes, data, len);
+	const std::vector<uint8_t> rb = applyOp(brushes, lights, data, len);
 	if (!rb.empty()) { broadcastAll(host, rb); g_dirty = true; }
 }
 
@@ -297,7 +319,7 @@ void onWebSocketClient(std::shared_ptr<rtc::WebSocket> ws) {
 }
 
 // Drain WebRTC inbound events on the main thread (which owns `brushes`).
-void drainRtc(std::vector<Brush>& brushes, ENetHost* host) {
+void drainRtc(std::vector<Brush>& brushes, std::vector<Light>& lights, ENetHost* host) {
 	std::queue<InMsg> local;
 	{
 		std::lock_guard<std::mutex> lk(g_mtx);
@@ -313,13 +335,13 @@ void drainRtc(std::vector<Brush>& brushes, ENetHost* host) {
 				g_players[pid] = PlayerInfo{pid};
 				printf("browser client joined as player %u (%zu brushes)\n", pid, brushes.size());
 				sendToChannel(m.dc, msgAssignId(pid, kProtocolVersion));
-				sendToChannel(m.dc, msgSnapshot(brushes));
+				sendToChannel(m.dc, msgSnapshot(brushes, lights));
 				break;
 			}
 			case InKind::Data: {
 				auto it = g_chanId.find(m.dc.get());
-				handleClientMessage(brushes, it != g_chanId.end() ? it->second : 0, m.bytes.data(),
-				                    m.bytes.size(), host);
+				handleClientMessage(brushes, lights, it != g_chanId.end() ? it->second : 0,
+				                    m.bytes.data(), m.bytes.size(), host);
 				break;
 			}
 			case InKind::Leave: {
@@ -366,8 +388,9 @@ int main(int argc, char** argv) {
 	if (!mapPath) mapPath = "cooped.map";
 
 	std::vector<Brush> brushes;
-	if (loadMap(mapPath, brushes))
-		printf("loaded map '%s' (%zu brushes)\n", mapPath, brushes.size());
+	std::vector<Light> lights;
+	if (loadMap(mapPath, brushes, lights))
+		printf("loaded map '%s' (%zu brushes, %zu lights)\n", mapPath, brushes.size(), lights.size());
 	else
 		buildScene(brushes);
 
@@ -389,12 +412,12 @@ int main(int argc, char** argv) {
 					g_players[pid] = PlayerInfo{pid};
 					printf("native client connected as player %u\n", pid);
 					sendENet(ev.peer, msgAssignId(pid, kProtocolVersion));
-					sendENet(ev.peer, msgSnapshot(brushes));
+					sendENet(ev.peer, msgSnapshot(brushes, lights));
 					break;
 				}
 				case ENET_EVENT_TYPE_RECEIVE: {
 					const uint32_t pid = (uint32_t)(uintptr_t)ev.peer->data;
-					handleClientMessage(brushes, pid, ev.packet->data, ev.packet->dataLength, server);
+					handleClientMessage(brushes, lights, pid, ev.packet->data, ev.packet->dataLength, server);
 					enet_packet_destroy(ev.packet);
 					break;
 				}
@@ -406,7 +429,7 @@ int main(int argc, char** argv) {
 					break;
 			}
 		}
-		drainRtc(brushes, server);
+		drainRtc(brushes, lights, server);
 
 		// Broadcast everyone's position ~20 Hz so clients can render each other.
 		const auto now = std::chrono::steady_clock::now();
@@ -417,12 +440,12 @@ int main(int argc, char** argv) {
 
 		// Autosave at most every 5s when the map has changed.
 		if (g_dirty && std::chrono::duration_cast<std::chrono::seconds>(now - lastSave).count() >= 5) {
-			if (saveMap(mapPath, brushes)) { g_dirty = false; printf("autosaved '%s'\n", mapPath); }
+			if (saveMap(mapPath, brushes, lights)) { g_dirty = false; printf("autosaved '%s'\n", mapPath); }
 			lastSave = now;
 		}
 	}
 
-	if (g_dirty) printf(saveMap(mapPath, brushes) ? "saved '%s' on exit\n" : "save failed\n", mapPath);
+	if (g_dirty) printf(saveMap(mapPath, brushes, lights) ? "saved '%s' on exit\n" : "save failed\n", mapPath);
 	enet_host_destroy(server);
 	return 0;
 }
