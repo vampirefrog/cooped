@@ -1396,6 +1396,19 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			bx::mtxRotateZ(matR, ag.yaw);
 			bx::mtxTranslate(matT, ag.pos.x, ag.pos.y, ag.pos.z);
 			bx::mtxMul(W, matT, matR);  // model already pre-centred + scaled at load
+			// DEBUG: draw the orange cube at the SAME W as the model. If the cube ends up
+			// directly under the bar but the FBX doesn't, then W is fine and the FBX renders
+			// to wrong positions (which would point at a vertex/index-buffer or ufbx issue).
+			if (bgfx::isValid(app->agentMesh.vbh)) {
+				bgfx::setTransform(W);
+				bgfx::setTexture(0, app->s_tex, app->whiteTex);
+				bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
+				bgfx::setVertexBuffer(0, app->agentMesh.vbh);
+				bgfx::setIndexBuffer(app->agentMesh.ibh);
+				bgfx::setUniform(app->u_albedo, fallback);
+				bgfx::setState(triState);
+				bgfx::submit(0, app->program);
+			}
 			bgfx::setTransform(W);
 			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
 			if (mdl && mdl->ok()) {
@@ -1403,16 +1416,6 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 				bgfx::setVertexBuffer(0, mdl->vbh);
 				bgfx::setIndexBuffer(mdl->ibh, 0, mdl->numIndices);
 				bgfx::setUniform(app->u_albedo, white);
-				bgfx::setState(triState);
-				bgfx::submit(0, app->program);
-			} else if (bgfx::isValid(app->agentMesh.vbh)) {
-				// Fallback: orange cube centred at feet + half-height. Use a vertical offset.
-				float Tc[16]; bx::mtxTranslate(Tc, ag.pos.x, ag.pos.y, ag.pos.z + kAgentHalf.z);
-				bgfx::setTransform(Tc);
-				bgfx::setTexture(0, app->s_tex, app->whiteTex);
-				bgfx::setVertexBuffer(0, app->agentMesh.vbh);
-				bgfx::setIndexBuffer(app->agentMesh.ibh);
-				bgfx::setUniform(app->u_albedo, fallback);
 				bgfx::setState(triState);
 				bgfx::submit(0, app->program);
 			}

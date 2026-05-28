@@ -67,6 +67,16 @@ Model loadFbxModel(const char* path, const bgfx::VertexLayout& layout, const cha
 
 	for (size_t mi = 0; mi < scene->meshes.count; ++mi) {
 		ufbx_mesh* msh = scene->meshes.data[mi];
+		float mbmin[3] = {1.0e30f, 1.0e30f, 1.0e30f}, mbmax[3] = {-1.0e30f, -1.0e30f, -1.0e30f};
+		for (size_t k = 0; k < msh->vertex_position.values.count; ++k) {
+			const ufbx_vec3 p = msh->vertex_position.values.data[k];
+			if (p.x < mbmin[0]) mbmin[0] = p.x; if (p.x > mbmax[0]) mbmax[0] = p.x;
+			if (p.y < mbmin[1]) mbmin[1] = p.y; if (p.y > mbmax[1]) mbmax[1] = p.y;
+			if (p.z < mbmin[2]) mbmin[2] = p.z; if (p.z > mbmax[2]) mbmax[2] = p.z;
+		}
+		printf("  fbx mesh[%zu] '%s' verts=%zu bbox [%.2f,%.2f,%.2f]..[%.2f,%.2f,%.2f]\n",
+		       mi, msh->name.data ? msh->name.data : "?", msh->vertex_position.values.count,
+		       mbmin[0], mbmin[1], mbmin[2], mbmax[0], mbmax[1], mbmax[2]);
 		const bool hasUv = msh->uv_sets.count > 0;
 		uint32_t tri[64 * 3];
 		for (size_t fi = 0; fi < msh->faces.count; ++fi) {
