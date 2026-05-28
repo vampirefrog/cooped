@@ -1430,7 +1430,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		                          BGFX_STATE_DEPTH_TEST_LEQUAL | BGFX_STATE_PT_LINES;
 		for (const auto& kv : app->agents) {
 			const AiAgent& ag = kv.second;
-			const float halfW = 9.0f;
+			const float halfW = 18.0f;  // 36 units wide so the bar is unmistakable
 			const bx::Vec3 c(ag.pos.x, ag.pos.y, ag.pos.z + 2.0f * kAgentHalf.z + 6.0f);
 			const bx::Vec3 l = bx::sub(c, bx::mul(camRight, halfW));
 			const bx::Vec3 rEnd = bx::add(c, bx::mul(camRight, halfW));
