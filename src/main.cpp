@@ -1395,20 +1395,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			float matR[16], matT[16], W[16];
 			bx::mtxRotateZ(matR, ag.yaw);
 			bx::mtxTranslate(matT, ag.pos.x, ag.pos.y, ag.pos.z);
-			bx::mtxMul(W, matT, matR);  // model already pre-centred + scaled at load
-			// DEBUG: draw the orange cube at the SAME W as the model. If the cube ends up
-			// directly under the bar but the FBX doesn't, then W is fine and the FBX renders
-			// to wrong positions (which would point at a vertex/index-buffer or ufbx issue).
-			if (bgfx::isValid(app->agentMesh.vbh)) {
-				bgfx::setTransform(W);
-				bgfx::setTexture(0, app->s_tex, app->whiteTex);
-				bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
-				bgfx::setVertexBuffer(0, app->agentMesh.vbh);
-				bgfx::setIndexBuffer(app->agentMesh.ibh);
-				bgfx::setUniform(app->u_albedo, fallback);
-				bgfx::setState(triState);
-				bgfx::submit(0, app->program);
-			}
+			// bx::mtxMul(out, A, B) computes out = B*A, NOT A*B. To get "rotate then translate"
+			// (T*R), pass (matR, matT) — otherwise the model orbits world origin as yaw changes.
+			bx::mtxMul(W, matR, matT);
 			bgfx::setTransform(W);
 			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
 			if (mdl && mdl->ok()) {
@@ -1416,6 +1405,16 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 				bgfx::setVertexBuffer(0, mdl->vbh);
 				bgfx::setIndexBuffer(mdl->ibh, 0, mdl->numIndices);
 				bgfx::setUniform(app->u_albedo, white);
+				bgfx::setState(triState);
+				bgfx::submit(0, app->program);
+			} else if (bgfx::isValid(app->agentMesh.vbh)) {
+				// Fallback: orange cube centred at feet + half-height (no rotation needed).
+				float Tc[16]; bx::mtxTranslate(Tc, ag.pos.x, ag.pos.y, ag.pos.z + kAgentHalf.z);
+				bgfx::setTransform(Tc);
+				bgfx::setTexture(0, app->s_tex, app->whiteTex);
+				bgfx::setVertexBuffer(0, app->agentMesh.vbh);
+				bgfx::setIndexBuffer(app->agentMesh.ibh);
+				bgfx::setUniform(app->u_albedo, fallback);
 				bgfx::setState(triState);
 				bgfx::submit(0, app->program);
 			}
@@ -1433,7 +1432,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		                          BGFX_STATE_DEPTH_TEST_LEQUAL | BGFX_STATE_PT_LINES;
 		for (const auto& kv : app->agents) {
 			const AiAgent& ag = kv.second;
-			const float halfW = 18.0f;  // 36 units wide so the bar is unmistakable
+			const float halfW = 9.0f;
 			const bx::Vec3 c(ag.pos.x, ag.pos.y, ag.pos.z + 2.0f * kAgentHalf.z + 6.0f);
 			const bx::Vec3 l = bx::sub(c, bx::mul(camRight, halfW));
 			const bx::Vec3 rEnd = bx::add(c, bx::mul(camRight, halfW));

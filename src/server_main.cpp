@@ -93,7 +93,7 @@ constexpr float kAgentSpeed = 90.0f;    // world units / second
 constexpr float kWanderRadius = 450.0f; // how far an agent picks its next goal
 constexpr uint32_t kAgentHp = 30;       // shots-to-kill * kShotDamage
 constexpr uint32_t kShotDamage = 10;    // one hitscan shot
-const bx::Vec3 kAgentHalf(16.0f, 16.0f, 18.0f);  // generous hitbox so shots register easily
+const bx::Vec3 kAgentHalf(12.0f, 12.0f, 18.0f);  // a touch wider than the avatar for forgiving aim
 void resolveShot(const std::vector<Brush>& brushes, const bx::Vec3& origin, const bx::Vec3& dir);
 
 Brush* findBrush(std::vector<Brush>& brushes, uint32_t id) {
@@ -287,7 +287,7 @@ void spawnAgents(int n) {
 	const float center[3] = {0, 0, 0};
 	for (int i = 0; i < n; ++i) {
 		float p[3];
-		if (!g_nav.randomPointAround(center, 100.0f, p)) continue;  // spawn close to origin
+		if (!g_nav.randomPointAround(center, 700.0f, p)) continue;
 		Agent a;
 		a.id = g_nextAgentId++;
 		a.pos[0] = p[0]; a.pos[1] = p[1]; a.pos[2] = p[2];
@@ -342,9 +342,6 @@ void resolveShot(const std::vector<Brush>& brushes, const bx::Vec3& origin, cons
 		float t;
 		if (rayAabb(origin, dir, mn, mx, t) && t < tAgent) { tAgent = t; hitIdx = (int)i; }
 	}
-	printf("shot from (%.0f,%.0f,%.0f) dir (%.2f,%.2f,%.2f) brushT=%.0f agentT=%.0f hitIdx=%d\n",
-	       origin.x, origin.y, origin.z, dir.x, dir.y, dir.z,
-	       tBrush > 1.0e20f ? -1.0f : tBrush, tAgent > 1.0e20f ? -1.0f : tAgent, hitIdx);
 	if (hitIdx < 0 || tAgent >= tBrush) return;  // missed, or a brush is in the way
 	Agent& a = g_agents[hitIdx];
 	if (a.hp <= kShotDamage) { printf("agent %u killed; respawning\n", a.id); respawnAgent(a); }
@@ -560,7 +557,7 @@ int main(int argc, char** argv) {
 	printf("cooped server: ENet udp:%u, WebRTC signaling %s:%u  (%zu brushes, map='%s')\n", port,
 	       wsCfg.enableTls ? "wss" : "ws", wsPort, brushes.size(), mapPath);
 
-	if (g_nav.build(brushes)) { spawnAgents(1); printf("navmesh built; %zu AI agents wandering\n", g_agents.size()); }
+	if (g_nav.build(brushes)) { spawnAgents(5); printf("navmesh built; %zu AI agents wandering\n", g_agents.size()); }
 	else printf("navmesh build failed (no walkable area?)\n");
 
 	auto lastSave = std::chrono::steady_clock::now();
