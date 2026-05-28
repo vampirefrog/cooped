@@ -1418,8 +1418,11 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			}
 		}
 
-		// HP bars are constant-colour overlays — switch back to flat shading first.
+		// HP bars are constant-colour overlays — switch back to flat shading first. Bar vertices
+		// are already in world space, so each draw needs an explicit identity transform (otherwise
+		// it inherits the NPC's T*Rz from the previous submit on some bgfx renderers).
 		setFlatLighting(app);
+		float identity[16]; bx::mtxIdentity(identity);
 		const float redCol[4] = {0.9f, 0.15f, 0.15f, 1.0f};
 		const float grnCol[4] = {0.2f, 0.95f, 0.2f, 1.0f};
 		const bx::Vec3 camRight = bx::normalize(bx::cross(bx::Vec3(0, 0, 1), fwd));
@@ -1439,6 +1442,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 				bgfx::TransientVertexBuffer tvb;
 				bgfx::allocTransientVertexBuffer(&tvb, 2, app->layout);
 				memcpy(tvb.data, v, sizeof(v));
+				bgfx::setTransform(identity);
 				bgfx::setTexture(0, app->s_tex, app->whiteTex);
 				bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
 				bgfx::setVertexBuffer(0, &tvb);
