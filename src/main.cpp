@@ -27,6 +27,7 @@
 #include "net.h"
 #include "physics.h"
 #include "protocol.h"
+#include "model.h"
 #if !defined(__EMSCRIPTEN__)
 #include "bake.h"
 #endif
@@ -251,7 +252,8 @@ struct App {
 	std::map<uint32_t, RemotePlayer> remotePlayers;   // other players, by id
 	Mesh avatarMesh;                                  // body-sized box for rendering them
 	std::map<uint32_t, AiAgent> agents;               // server-driven AI agents, by id
-	Mesh agentMesh;                                   // small cube for rendering them
+	Mesh agentMesh;                                   // fallback cube if a character model is missing
+	std::vector<Model> npcModels;                     // characters; each agent picks one by id
 	bgfx::VertexBufferHandle navDbgVbh = BGFX_INVALID_HANDLE;  // navmesh wireframe (line list)
 	uint32_t navDbgVerts = 0;
 	bool showNavMesh = false;                         // N toggles the navmesh debug overlay
@@ -1035,8 +1037,13 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char** argv) {
 
 	// Avatar: a body-sized box centered at origin (translated per remote player when drawn).
 	app->avatarMesh = buildMeshFromBrush(makeBox({0, 0, 0}, kPlayerHalf, 0.8f, 0.8f, 0.8f), app->layout);
-	// AI agent: a smaller, brighter cube (orange) centered at origin.
+	// AI agent: a smaller, brighter cube (orange) centered at origin — fallback if a model fails.
 	app->agentMesh = buildMeshFromBrush(makeBox({0, 0, 0}, kAgentHalf, 0.95f, 0.55f, 0.15f), app->layout);
+	// NPC characters (FBX). Each agent picks one by id % count. Meshy exports face +Y locally,
+	// so a -90deg pre-rotation around Z aligns them with cooped's "yaw=0 means facing +X".
+	const float kMeshyYaw = -bx::kPiHalf;
+	app->npcModels.push_back(loadFbxModel("data/frog.fbx",  app->layout, "data/frog.png",  32.0f, kMeshyYaw));
+	app->npcModels.push_back(loadFbxModel("data/sunny.fbx", app->layout, "data/sunny.png", 32.0f, kMeshyYaw));
 
 	buildInitialScene(app);  // local sandbox; replaced by the server snapshot if we connect
 	rebuildGrid(app);
@@ -1372,9 +1379,47 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		}
 	}
 
-	// AI agents: a small orange cube sitting on the navmesh, with an HP bar billboarded above.
-	if (bgfx::isValid(app->agentMesh.vbh)) {
-		const float col[4] = {0.95f, 0.55f, 0.15f, 1.0f};
+	// AI agents: each one renders as a character (FBX), with an HP bar billboarded above. NPCs
+	// get sun+ambient (no lightmap — their UVs are the model's, not the lightmap atlas's).
+	if (!app->agents.empty()) {
+		const bx::Vec3 sd = bx::normalize(bx::Vec3(0.35f, 0.25f, 0.9f));
+		const float lpNpc[4] = {0.0f, 0.20f, 0.0f, 0.0f};   // 0 point lights, ambient, no lightmap
+		const float sunNpc[4] = {sd.x, sd.y, sd.z, 0.6f};
+		bgfx::setUniform(app->u_lightParams, lpNpc);
+		bgfx::setUniform(app->u_sunDir, sunNpc);
+		const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+		const float fallback[4] = {0.95f, 0.55f, 0.15f, 1.0f};  // orange cube if a model is missing
+		for (const auto& kv : app->agents) {
+			const AiAgent& ag = kv.second;
+			const Model* mdl = !app->npcModels.empty() ? &app->npcModels[kv.first % app->npcModels.size()] : nullptr;
+			float matR[16], matT[16], W[16];
+			bx::mtxRotateZ(matR, ag.yaw);
+			bx::mtxTranslate(matT, ag.pos.x, ag.pos.y, ag.pos.z);
+			bx::mtxMul(W, matT, matR);  // model already pre-centred + scaled at load
+			bgfx::setTransform(W);
+			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
+			if (mdl && mdl->ok()) {
+				bgfx::setTexture(0, app->s_tex, bgfx::isValid(mdl->texture) ? mdl->texture : app->whiteTex);
+				bgfx::setVertexBuffer(0, mdl->vbh);
+				bgfx::setIndexBuffer(mdl->ibh, 0, mdl->numIndices);
+				bgfx::setUniform(app->u_albedo, white);
+				bgfx::setState(triState);
+				bgfx::submit(0, app->program);
+			} else if (bgfx::isValid(app->agentMesh.vbh)) {
+				// Fallback: orange cube centred at feet + half-height. Use a vertical offset.
+				float Tc[16]; bx::mtxTranslate(Tc, ag.pos.x, ag.pos.y, ag.pos.z + kAgentHalf.z);
+				bgfx::setTransform(Tc);
+				bgfx::setTexture(0, app->s_tex, app->whiteTex);
+				bgfx::setVertexBuffer(0, app->agentMesh.vbh);
+				bgfx::setIndexBuffer(app->agentMesh.ibh);
+				bgfx::setUniform(app->u_albedo, fallback);
+				bgfx::setState(triState);
+				bgfx::submit(0, app->program);
+			}
+		}
+
+		// HP bars are constant-colour overlays — switch back to flat shading first.
+		setFlatLighting(app);
 		const float redCol[4] = {0.9f, 0.15f, 0.15f, 1.0f};
 		const float grnCol[4] = {0.2f, 0.95f, 0.2f, 1.0f};
 		const bx::Vec3 camRight = bx::normalize(bx::cross(bx::Vec3(0, 0, 1), fwd));
@@ -1382,18 +1427,6 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		                          BGFX_STATE_DEPTH_TEST_LEQUAL | BGFX_STATE_PT_LINES;
 		for (const auto& kv : app->agents) {
 			const AiAgent& ag = kv.second;
-			float mtx[16];
-			bx::mtxTranslate(mtx, ag.pos.x, ag.pos.y, ag.pos.z + kAgentHalf.z);
-			bgfx::setTransform(mtx);
-			bgfx::setTexture(0, app->s_tex, app->whiteTex);
-			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
-			bgfx::setVertexBuffer(0, app->agentMesh.vbh);
-			bgfx::setIndexBuffer(app->agentMesh.ibh);
-			bgfx::setUniform(app->u_albedo, col);
-			bgfx::setState(triState);
-			bgfx::submit(0, app->program);
-
-			// HP bar: red full-width behind, green hp/maxHp on top — both oriented along camRight.
 			const float halfW = 9.0f;
 			const bx::Vec3 c(ag.pos.x, ag.pos.y, ag.pos.z + 2.0f * kAgentHalf.z + 6.0f);
 			const bx::Vec3 l = bx::sub(c, bx::mul(camRight, halfW));
@@ -1545,6 +1578,7 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		app->grid.destroy();
 		app->avatarMesh.destroy();
 		app->agentMesh.destroy();
+		for (Model& m : app->npcModels) m.destroy();
 		if (bgfx::isValid(app->navDbgVbh)) bgfx::destroy(app->navDbgVbh);
 		if (bgfx::isValid(app->lightWire)) bgfx::destroy(app->lightWire);
 		for (bgfx::UniformHandle u : {app->u_lightParams, app->u_sunDir, app->u_lightPosRadius, app->u_lightColor})

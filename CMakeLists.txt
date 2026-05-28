@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cooped CXX)
+project(cooped CXX C)
 
 set(CMAKE_CXX_STANDARD 20)  # bx/bgfx headers require C++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,6 +48,15 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(SDL3 bgfx)
+
+# ufbx: single-file FBX parser for NPC / mapmodel meshes (native + web). MIT, portable C.
+FetchContent_Declare(
+  ufbx
+  GIT_REPOSITORY https://github.com/ufbx/ufbx.git
+  GIT_TAG        master
+  GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(ufbx)
 
 # ENet — native UDP transport for the client and the dedicated server. Browsers can't do raw
 # UDP, so the web build skips it (net.cpp stubs out) until the WebRTC transport (Milestone 7).
@@ -177,8 +186,10 @@ add_executable(cooped
   src/brush.cpp
   src/physics.cpp
   src/net.cpp
+  src/model.cpp
+  ${ufbx_SOURCE_DIR}/ufbx.c
 )
-target_include_directories(cooped PRIVATE src)
+target_include_directories(cooped PRIVATE src ${ufbx_SOURCE_DIR})
 # Ensure the embedded shader headers are (re)generated before main.cpp compiles (native only).
 if(NOT EMSCRIPTEN)
   add_dependencies(cooped cooped_shaders)
@@ -241,5 +252,9 @@ if(EMSCRIPTEN)
     "--preload-file=${CMAKE_SOURCE_DIR}/data/tiles.jpg@/data/tiles.jpg"
     "--preload-file=${CMAKE_SOURCE_DIR}/data/rosendal_plains_2_1k.hdr@/data/rosendal_plains_2_1k.hdr"
     "--preload-file=${CMAKE_SOURCE_DIR}/data/sunny_rose_garden_1k.hdr@/data/sunny_rose_garden_1k.hdr"
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/frog.fbx@/data/frog.fbx"
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/frog.png@/data/frog.png"
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/sunny.fbx@/data/sunny.fbx"
+    "--preload-file=${CMAKE_SOURCE_DIR}/data/sunny.png@/data/sunny.png"
   )
 endif()
