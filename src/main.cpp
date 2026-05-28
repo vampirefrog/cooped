@@ -155,9 +155,11 @@ struct RemotePlayer {
 struct AiAgent {  // server-driven wandering AI; pos is its feet on the navmesh
 	bx::Vec3 pos = bx::Vec3(0, 0, 0);
 	float yaw = 0.0f;
+	uint32_t hp = 0;
 };
 
 const bx::Vec3 kAgentHalf(10.0f, 10.0f, 16.0f);  // a smaller cube than the player avatar
+constexpr uint32_t kAgentMaxHp = 30;             // mirror the server (hp / kAgentMaxHp = bar fill)
 
 struct Mesh {
 	bgfx::VertexBufferHandle vbh = BGFX_INVALID_HANDLE;
@@ -253,6 +255,11 @@ struct App {
 	bgfx::VertexBufferHandle navDbgVbh = BGFX_INVALID_HANDLE;  // navmesh wireframe (line list)
 	uint32_t navDbgVerts = 0;
 	bool showNavMesh = false;                         // N toggles the navmesh debug overlay
+	// Hitscan firing (play mode, LMB): cooldown + a brief tracer line for visual feedback.
+	uint64_t nextFireNs = 0;
+	uint64_t tracerExpireNs = 0;
+	bx::Vec3 tracerStart = bx::Vec3(0, 0, 0);
+	bx::Vec3 tracerEnd = bx::Vec3(0, 0, 0);
 	uint64_t lastStateSendNs = 0;
 
 	Camera cam;
@@ -415,6 +422,27 @@ void resetPushPull(App* app) { app->ppId = 0; app->ppFace = -1; }
 
 void sendMsg(App* app, const std::vector<uint8_t>& m) {
 	netSend(app->net, m.data(), m.size(), true);
+}
+
+// Fire a hitscan shot if the cooldown has elapsed: send the shot to the server (which resolves
+// damage authoritatively) and draw a brief local tracer to the nearest brush hit for feedback.
+void tryFire(App* app) {
+	const uint64_t now = SDL_GetTicksNS();
+	if (now < app->nextFireNs) return;
+	app->nextFireNs = now + 250'000'000ULL;   // 4 shots/sec
+	const bx::Vec3 fwd = app->cam.forward();
+	float tMax = 5000.0f;
+	for (const Brush& b : app->brushes) {
+		const RayHit h = rayBrushIntersect(app->cam.pos, fwd, b);
+		if (h.hit && h.t > 0.0f && h.t < tMax) tMax = h.t;
+	}
+	// Offset the tracer start down-right from the eye (a "muzzle" position) so the line is
+	// visible from a couple of pixels off-screen-center instead of a single point straight ahead.
+	const bx::Vec3 right = bx::normalize(bx::cross(bx::Vec3(0, 0, 1), fwd));
+	app->tracerStart = bx::add(bx::add(app->cam.pos, bx::mul(right, 4.0f)), bx::Vec3(0, 0, -4.0f));
+	app->tracerEnd = bx::add(app->cam.pos, bx::mul(fwd, tMax));
+	app->tracerExpireNs = now + 80'000'000ULL;  // ~80 ms streak
+	sendMsg(app, msgPlayerFire(app->cam.pos, fwd));
 }
 
 void pushUndo(App* app) {
@@ -815,7 +843,8 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 				const uint32_t id = r.u32();
 				const bx::Vec3 p = r.vec3();
 				const float yaw = r.f32();
-				if (r.ok) app->agents[id] = AiAgent{p, yaw};
+				const uint32_t hp = r.u32();
+				if (r.ok) app->agents[id] = AiAgent{p, yaw, hp};
 			}
 			break;
 		}
@@ -1248,6 +1277,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 
 		app->onGround = movePlayer(app->brushes, app->playerPos, app->playerVel, kPlayerHalf, dt);
 		app->cam.pos = bx::add(app->playerPos, bx::Vec3(0, 0, kEyeOffset));
+
+		// Hold LMB to auto-fire (tryFire enforces the cooldown).
+		if (SDL_GetMouseState(nullptr, nullptr) & SDL_BUTTON_LMASK) tryFire(app);
 	}
 
 	updateTargeted(app);
@@ -1340,9 +1372,14 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		}
 	}
 
-	// AI agents: a small orange cube sitting on the navmesh (raise by half its height).
+	// AI agents: a small orange cube sitting on the navmesh, with an HP bar billboarded above.
 	if (bgfx::isValid(app->agentMesh.vbh)) {
 		const float col[4] = {0.95f, 0.55f, 0.15f, 1.0f};
+		const float redCol[4] = {0.9f, 0.15f, 0.15f, 1.0f};
+		const float grnCol[4] = {0.2f, 0.95f, 0.2f, 1.0f};
+		const bx::Vec3 camRight = bx::normalize(bx::cross(bx::Vec3(0, 0, 1), fwd));
+		const uint64_t barState = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
+		                          BGFX_STATE_DEPTH_TEST_LEQUAL | BGFX_STATE_PT_LINES;
 		for (const auto& kv : app->agents) {
 			const AiAgent& ag = kv.second;
 			float mtx[16];
@@ -1354,6 +1391,49 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 			bgfx::setIndexBuffer(app->agentMesh.ibh);
 			bgfx::setUniform(app->u_albedo, col);
 			bgfx::setState(triState);
+			bgfx::submit(0, app->program);
+
+			// HP bar: red full-width behind, green hp/maxHp on top — both oriented along camRight.
+			const float halfW = 9.0f;
+			const bx::Vec3 c(ag.pos.x, ag.pos.y, ag.pos.z + 2.0f * kAgentHalf.z + 6.0f);
+			const bx::Vec3 l = bx::sub(c, bx::mul(camRight, halfW));
+			const bx::Vec3 rEnd = bx::add(c, bx::mul(camRight, halfW));
+			const float frac = bx::clamp((float)ag.hp / (float)kAgentMaxHp, 0.0f, 1.0f);
+			const bx::Vec3 gEnd = bx::add(l, bx::mul(camRight, 2.0f * halfW * frac));
+			auto drawSeg = [&](const bx::Vec3& a, const bx::Vec3& b, const float* color) {
+				if (bgfx::getAvailTransientVertexBuffer(2, app->layout) < 2) return;
+				BrushVertex v[2] = {{a.x, a.y, a.z, 0, 0, 1, 0, 0}, {b.x, b.y, b.z, 0, 0, 1, 0, 0}};
+				bgfx::TransientVertexBuffer tvb;
+				bgfx::allocTransientVertexBuffer(&tvb, 2, app->layout);
+				memcpy(tvb.data, v, sizeof(v));
+				bgfx::setTexture(0, app->s_tex, app->whiteTex);
+				bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
+				bgfx::setVertexBuffer(0, &tvb);
+				bgfx::setUniform(app->u_albedo, color);
+				bgfx::setState(barState);
+				bgfx::submit(0, app->program);
+			};
+			drawSeg(l, rEnd, redCol);
+			if (frac > 0.0f) drawSeg(l, gEnd, grnCol);
+		}
+	}
+
+	// Hitscan tracer: a brief yellow line from the eye to the impact point (local feedback).
+	if (SDL_GetTicksNS() < app->tracerExpireNs) {
+		BrushVertex tv[2] = {
+		    {app->tracerStart.x, app->tracerStart.y, app->tracerStart.z, 0, 0, 1, 0, 0},
+		    {app->tracerEnd.x,   app->tracerEnd.y,   app->tracerEnd.z,   0, 0, 1, 0, 0},
+		};
+		if (bgfx::getAvailTransientVertexBuffer(2, app->layout) >= 2) {
+			bgfx::TransientVertexBuffer tvb;
+			bgfx::allocTransientVertexBuffer(&tvb, 2, app->layout);
+			memcpy(tvb.data, tv, sizeof(tv));
+			const float tcol[4] = {1.0f, 0.95f, 0.3f, 1.0f};
+			bgfx::setTexture(0, app->s_tex, app->whiteTex);
+			bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
+			bgfx::setVertexBuffer(0, &tvb);
+			bgfx::setUniform(app->u_albedo, tcol);
+			bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_DEPTH_TEST_LEQUAL | BGFX_STATE_PT_LINES);
 			bgfx::submit(0, app->program);
 		}
 	}
@@ -1440,7 +1520,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::dbgTextPrintf(1, 6, 0x0d, "lights:  L:place  drag a cube face to move  K:delete  C:color (%d)  |  count:%zu",
 		                    app->placeColorIdx, app->lights.size());
 	} else {
-		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   B:sky   N:navmesh   E:edit   esc:quit",
+		const uint16_t cols = uint16_t(app->width / 8), rows = uint16_t(app->height / 16);
+		bgfx::dbgTextPrintf(cols / 2, rows / 2, 0x0f, "+");  // aim reticle
+		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  LMB:fire  %s   B:sky   N:navmesh   E:edit   esc:quit",
 		                    app->onGround ? "[grounded]" : "[airborne]");
 	}
 	if (app->net)

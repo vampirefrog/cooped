@@ -12,7 +12,7 @@
 
 // Bump on any wire-format change. The server sends it in AssignId; the client compares and
 // surfaces a clear mismatch instead of silently rendering a garbled map.
-constexpr uint32_t kProtocolVersion = 8;
+constexpr uint32_t kProtocolVersion = 9;
 
 enum class MsgType : uint8_t {
 	Snapshot       = 1,  // server->client: full map
@@ -31,6 +31,7 @@ enum class MsgType : uint8_t {
 	Lightmap       = 14, // baked lightmap: atlas size + RGBM RGBA8 pixels + per-soup-vertex UVs
 	AgentStates    = 15, // server->clients: [count]{id, pos, yaw} of server-driven AI agents
 	NavMesh        = 16, // server->client: walkable triangle soup (cooped xyz) for debug draw
+	PlayerFire     = 17, // client->server: hitscan shot — origin + direction (server resolves)
 };
 
 struct ByteWriter {
@@ -214,6 +215,14 @@ inline std::vector<uint8_t> msgAssignId(uint32_t id, uint32_t protocolVersion) {
 	w.u8((uint8_t)MsgType::AssignId);
 	w.u32(id);
 	w.u32(protocolVersion);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgPlayerFire(const bx::Vec3& origin, const bx::Vec3& dir) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::PlayerFire);
+	w.vec3(origin);
+	w.vec3(dir);
 	return w.data;
 }
 

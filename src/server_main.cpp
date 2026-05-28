@@ -86,10 +86,15 @@ struct Agent {
 	float yaw = 0.0f;
 	std::vector<float> path;      // flattened xyz straight-path waypoints (cooped coords)
 	size_t wp = 0;                // index of the current target waypoint
+	uint32_t hp = 30;             // shot down at 0 -> respawn (kAgentHp)
 };
 std::vector<Agent> g_agents;
 constexpr float kAgentSpeed = 90.0f;    // world units / second
 constexpr float kWanderRadius = 450.0f; // how far an agent picks its next goal
+constexpr uint32_t kAgentHp = 30;       // shots-to-kill * kShotDamage
+constexpr uint32_t kShotDamage = 10;    // one hitscan shot
+const bx::Vec3 kAgentHalf(10.0f, 10.0f, 16.0f);  // mirror the client's agent half-extents
+void resolveShot(const std::vector<Brush>& brushes, const bx::Vec3& origin, const bx::Vec3& dir);
 
 Brush* findBrush(std::vector<Brush>& brushes, uint32_t id) {
 	for (Brush& b : brushes) if (b.id == id) return &b;
@@ -212,6 +217,14 @@ void sendENet(ENetPeer* peer, const std::vector<uint8_t>& msg) {
 void handleClientMessage(std::vector<Brush>& brushes, std::vector<Light>& lights, uint32_t senderId,
                          const uint8_t* data, size_t len, ENetHost* host) {
 	if (len < 1) return;
+	if ((MsgType)data[0] == MsgType::PlayerFire) {
+		ByteReader r(data, len);
+		r.u8();
+		const bx::Vec3 o = r.vec3();
+		const bx::Vec3 d = r.vec3();
+		if (r.ok) resolveShot(brushes, o, d);
+		return;
+	}
 	if ((MsgType)data[0] == MsgType::PlayerState) {
 		ByteReader r(data, len);
 		r.u8();
@@ -283,6 +296,58 @@ void spawnAgents(int n) {
 	}
 }
 
+// Teleport an agent to a fresh random navmesh point and reset its HP/path.
+void respawnAgent(Agent& a) {
+	const float center[3] = {0, 0, 0};
+	float p[3];
+	if (g_nav.randomPointAround(center, 700.0f, p)) { a.pos[0] = p[0]; a.pos[1] = p[1]; a.pos[2] = p[2]; }
+	a.hp = kAgentHp;
+	a.path.clear();
+	a.wp = 0;
+	agentPickGoal(a);
+}
+
+// Ray vs axis-aligned box (slab method). tHit is the entry distance along dir (>0 for ahead).
+bool rayAabb(const bx::Vec3& o, const bx::Vec3& d, const bx::Vec3& cmin, const bx::Vec3& cmax, float& tHit) {
+	const float oo[3] = {o.x, o.y, o.z}, dd[3] = {d.x, d.y, d.z};
+	const float lo[3] = {cmin.x, cmin.y, cmin.z}, hi[3] = {cmax.x, cmax.y, cmax.z};
+	float tmin = 0.0f, tmax = 1.0e30f;
+	for (int i = 0; i < 3; ++i) {
+		if (std::fabs(dd[i]) < 1.0e-8f) { if (oo[i] < lo[i] || oo[i] > hi[i]) return false; continue; }
+		float t1 = (lo[i] - oo[i]) / dd[i], t2 = (hi[i] - oo[i]) / dd[i];
+		if (t1 > t2) std::swap(t1, t2);
+		if (t1 > tmin) tmin = t1;
+		if (t2 < tmax) tmax = t2;
+		if (tmin > tmax) return false;
+	}
+	if (tmax < 0.0f) return false;
+	tHit = (tmin >= 0.0f) ? tmin : tmax;
+	return tHit > 0.0f;
+}
+
+// Server-authoritative hitscan resolution: pick the nearest agent the shot reaches before any
+// brush occludes it; apply damage; respawn if killed. (Player-vs-player is intentionally skipped.)
+void resolveShot(const std::vector<Brush>& brushes, const bx::Vec3& origin, const bx::Vec3& dir) {
+	float tBrush = 1.0e30f;
+	for (const Brush& b : brushes) {
+		const RayHit h = rayBrushIntersect(origin, dir, b);
+		if (h.hit && h.t > 0.0f && h.t < tBrush) tBrush = h.t;
+	}
+	int hitIdx = -1;
+	float tAgent = 1.0e30f;
+	for (size_t i = 0; i < g_agents.size(); ++i) {
+		const Agent& a = g_agents[i];
+		const bx::Vec3 c(a.pos[0], a.pos[1], a.pos[2] + kAgentHalf.z);
+		const bx::Vec3 mn = bx::sub(c, kAgentHalf), mx = bx::add(c, kAgentHalf);
+		float t;
+		if (rayAabb(origin, dir, mn, mx, t) && t < tAgent) { tAgent = t; hitIdx = (int)i; }
+	}
+	if (hitIdx < 0 || tAgent >= tBrush) return;  // missed, or a brush is in the way
+	Agent& a = g_agents[hitIdx];
+	if (a.hp <= kShotDamage) { printf("agent %u killed; respawning\n", a.id); respawnAgent(a); }
+	else { a.hp -= kShotDamage; printf("agent %u hit (hp %u)\n", a.id, a.hp); }
+}
+
 // Advance each agent along its path; pick a new goal when it arrives or its path runs out.
 void stepAgents(float dt) {
 	for (Agent& a : g_agents) {
@@ -296,6 +361,36 @@ void stepAgents(float dt) {
 		if (d <= step) { a.pos[0] = w[0]; a.pos[1] = w[1]; a.pos[2] = w[2]; ++a.wp; }
 		else { a.pos[0] += dx / d * step; a.pos[1] += dy / d * step; a.pos[2] += dz * (step / d); }
 	}
+	// Soft separation: keep agents from overlapping each other and the players. Pure XY pushback
+	// after movement — the agent yields, so the player can shove through, and agents don't stack.
+	const float kAgentR = 12.0f, kPlayerR = 18.0f;
+	const float minA = kAgentR * 2.0f, minP = kAgentR + kPlayerR;
+	for (int it = 0; it < 2; ++it) {           // 2 relaxation passes is plenty for this density
+		for (size_t i = 0; i < g_agents.size(); ++i) {
+			for (size_t j = i + 1; j < g_agents.size(); ++j) {
+				float dx = g_agents[j].pos[0] - g_agents[i].pos[0];
+				float dy = g_agents[j].pos[1] - g_agents[i].pos[1];
+				const float d2 = dx * dx + dy * dy;
+				if (d2 < minA * minA && d2 > 1.0e-4f) {
+					const float dist = std::sqrt(d2), push = (minA - dist) * 0.5f;
+					dx /= dist; dy /= dist;
+					g_agents[i].pos[0] -= dx * push; g_agents[i].pos[1] -= dy * push;
+					g_agents[j].pos[0] += dx * push; g_agents[j].pos[1] += dy * push;
+				}
+			}
+			for (const auto& kv : g_players) {
+				if (!kv.second.hasState) continue;
+				const bx::Vec3& p = kv.second.pos;
+				float dx = g_agents[i].pos[0] - p.x, dy = g_agents[i].pos[1] - p.y;
+				const float d2 = dx * dx + dy * dy;
+				if (d2 < minP * minP && d2 > 1.0e-4f) {
+					const float dist = std::sqrt(d2), push = (minP - dist);
+					dx /= dist; dy /= dist;
+					g_agents[i].pos[0] += dx * push; g_agents[i].pos[1] += dy * push;
+				}
+			}
+		}
+	}
 }
 
 std::vector<uint8_t> buildAgentStates() {
@@ -306,6 +401,7 @@ std::vector<uint8_t> buildAgentStates() {
 		w.u32(a.id);
 		w.f32(a.pos[0]); w.f32(a.pos[1]); w.f32(a.pos[2]);
 		w.f32(a.yaw);
+		w.u32(a.hp);
 	}
 	return w.data;
 }
