@@ -240,6 +240,9 @@ struct App {
 	Mesh avatarMesh;                                  // body-sized box for rendering them
 	std::map<uint32_t, AiAgent> agents;               // server-driven AI agents, by id
 	Mesh agentMesh;                                   // small cube for rendering them
+	bgfx::VertexBufferHandle navDbgVbh = BGFX_INVALID_HANDLE;  // navmesh wireframe (line list)
+	uint32_t navDbgVerts = 0;
+	bool showNavMesh = false;                         // N toggles the navmesh debug overlay
 	uint64_t lastStateSendNs = 0;
 
 	Camera cam;
@@ -350,6 +353,28 @@ void applyLightmapTexture(App* app, uint32_t w, uint32_t h, const std::vector<ui
 	    bgfx::copy(pixels.data(), (uint32_t)pixels.size()));
 	rebuildSceneMeshesLightmap(app, vertexUV);
 	app->hasLightmap = true;
+}
+
+// Build the navmesh debug overlay: turn the walkable triangle soup into a line list (each
+// triangle's 3 edges), lifted slightly off the floor so it reads over the surface.
+void buildNavDebugMesh(App* app, const std::vector<float>& tris) {
+	if (bgfx::isValid(app->navDbgVbh)) { bgfx::destroy(app->navDbgVbh); app->navDbgVbh = BGFX_INVALID_HANDLE; }
+	app->navDbgVerts = 0;
+	const size_t ntri = tris.size() / 9;
+	if (ntri == 0) return;
+	std::vector<BrushVertex> v;
+	v.reserve(ntri * 6);
+	auto pt = [&](size_t i) { return bx::Vec3(tris[i * 3 + 0], tris[i * 3 + 1], tris[i * 3 + 2] + 1.5f); };
+	auto edge = [&](const bx::Vec3& a, const bx::Vec3& b) {
+		v.push_back({a.x, a.y, a.z, 0, 0, 1, 0, 0});
+		v.push_back({b.x, b.y, b.z, 0, 0, 1, 0, 0});
+	};
+	for (size_t t = 0; t < ntri; ++t) {
+		const bx::Vec3 a = pt(t * 3 + 0), b = pt(t * 3 + 1), c = pt(t * 3 + 2);
+		edge(a, b); edge(b, c); edge(c, a);
+	}
+	app->navDbgVbh = bgfx::createVertexBuffer(bgfx::copy(v.data(), uint32_t(v.size() * sizeof(BrushVertex))), app->layout);
+	app->navDbgVerts = (uint32_t)v.size();
 }
 
 void rebuildGrid(App* app) {
@@ -784,6 +809,16 @@ void applyNetMessage(App* app, const uint8_t* data, size_t len) {
 			}
 			break;
 		}
+		case MsgType::NavMesh: {  // walkable triangle soup for the debug overlay
+			const uint32_t n = r.u32();
+			const uint8_t* fp = r.take((size_t)n * sizeof(float));
+			if (r.ok && fp) {
+				std::vector<float> tris(n);
+				if (n) memcpy(tris.data(), fp, (size_t)n * sizeof(float));
+				buildNavDebugMesh(app, tris);
+			}
+			break;
+		}
 		case MsgType::PlayerState:  // client->server only
 			break;
 	}
@@ -1042,6 +1077,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 			switch (event->key.key) {
 				case SDLK_ESCAPE: return SDL_APP_SUCCESS;
 					case SDLK_B: app->skyIdx = (app->skyIdx + 1) % 2; break;  // cycle skybox
+					case SDLK_N: app->showNavMesh = !app->showNavMesh; break;  // toggle navmesh overlay
 				case SDLK_E:
 					app->editMode = !app->editMode;
 					app->selectedId = 0;
@@ -1291,6 +1327,17 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		}
 	}
 
+	// Navmesh debug overlay (N): the walkable surface as a cyan wireframe over the floor.
+	if (app->showNavMesh && bgfx::isValid(app->navDbgVbh)) {
+		const float navCol[4] = {0.2f, 0.8f, 1.0f, 1.0f};
+		bgfx::setTexture(0, app->s_tex, app->whiteTex);
+		bgfx::setTexture(1, app->s_lightmap, app->whiteTex);
+		bgfx::setVertexBuffer(0, app->navDbgVbh, 0, app->navDbgVerts);
+		bgfx::setUniform(app->u_albedo, navCol);
+		bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A | BGFX_STATE_DEPTH_TEST_LEQUAL | BGFX_STATE_PT_LINES);
+		bgfx::submit(0, app->program);
+	}
+
 	// Outline a face (selected = bright, else targeted = subtle) — the polygon edges as lines,
 	// lifted slightly off the surface. Easier on the eyes than recoloring the whole face.
 	const bool haveSel = selIdx >= 0 && app->selectedFace >= 0;
@@ -1358,7 +1405,7 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 		bgfx::dbgTextPrintf(1, 6, 0x0d, "lights:  L:place  drag a cube face to move  K:delete  C:color (%d)  |  count:%zu",
 		                    app->placeColorIdx, app->lights.size());
 	} else {
-		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   B:sky   E:edit   esc:quit",
+		bgfx::dbgTextPrintf(1, 1, 0x0f, "PLAY  WASD:walk  space:jump  %s   B:sky   N:navmesh   E:edit   esc:quit",
 		                    app->onGround ? "[grounded]" : "[airborne]");
 	}
 	if (app->net)
@@ -1378,6 +1425,7 @@ void SDL_AppQuit(void* appstate, SDL_AppResult) {
 		app->grid.destroy();
 		app->avatarMesh.destroy();
 		app->agentMesh.destroy();
+		if (bgfx::isValid(app->navDbgVbh)) bgfx::destroy(app->navDbgVbh);
 		if (bgfx::isValid(app->lightWire)) bgfx::destroy(app->lightWire);
 		for (bgfx::UniformHandle u : {app->u_lightParams, app->u_sunDir, app->u_lightPosRadius, app->u_lightColor})
 			if (bgfx::isValid(u)) bgfx::destroy(u);

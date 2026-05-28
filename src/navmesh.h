@@ -21,8 +21,12 @@ public:
 	// Straight path from start to end (cooped coords) as flattened xyz waypoints. false if none.
 	bool findPath(const float start[3], const float end[3], std::vector<float>& outPts) const;
 
+	// Walkable surface as a triangle soup (cooped coords, 9 floats per triangle) for debug draw.
+	const std::vector<float>& debugTriangles() const { return m_debugTris; }
+
 private:
 	void destroy();
 	dtNavMesh* m_navMesh = nullptr;
 	dtNavMeshQuery* m_query = nullptr;
+	std::vector<float> m_debugTris;
 };

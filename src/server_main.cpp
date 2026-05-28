@@ -396,6 +396,7 @@ void drainRtc(std::vector<Brush>& brushes, std::vector<Light>& lights, ENetHost*
 				sendToChannel(m.dc, msgAssignId(pid, kProtocolVersion));
 				sendToChannel(m.dc, msgSnapshot(brushes, lights));
 				if (g_lightmap.valid()) sendToChannel(m.dc, msgLightmap(g_lightmap));
+				if (g_nav.valid()) sendToChannel(m.dc, msgNavMesh(g_nav.debugTriangles()));
 				break;
 			}
 			case InKind::Data: {
@@ -478,6 +479,7 @@ int main(int argc, char** argv) {
 					sendENet(ev.peer, msgAssignId(pid, kProtocolVersion));
 					sendENet(ev.peer, msgSnapshot(brushes, lights));
 					if (g_lightmap.valid()) sendENet(ev.peer, msgLightmap(g_lightmap));
+					if (g_nav.valid()) sendENet(ev.peer, msgNavMesh(g_nav.debugTriangles()));
 					break;
 				}
 				case ENET_EVENT_TYPE_RECEIVE: {
@@ -503,6 +505,7 @@ int main(int argc, char** argv) {
 			g_nav.build(brushes);
 			g_navDirty = false;
 			lastNavBuild = now;
+			if (g_nav.valid()) broadcastAll(server, msgNavMesh(g_nav.debugTriangles()));  // refresh overlay
 		}
 
 		// Step the AI and broadcast everyone (players + agents) ~20 Hz so clients can render them.

@@ -12,7 +12,7 @@
 
 // Bump on any wire-format change. The server sends it in AssignId; the client compares and
 // surfaces a clear mismatch instead of silently rendering a garbled map.
-constexpr uint32_t kProtocolVersion = 7;
+constexpr uint32_t kProtocolVersion = 8;
 
 enum class MsgType : uint8_t {
 	Snapshot       = 1,  // server->client: full map
@@ -30,6 +30,7 @@ enum class MsgType : uint8_t {
 	SetLightPos    = 13, // light id + position
 	Lightmap       = 14, // baked lightmap: atlas size + RGBM RGBA8 pixels + per-soup-vertex UVs
 	AgentStates    = 15, // server->clients: [count]{id, pos, yaw} of server-driven AI agents
+	NavMesh        = 16, // server->client: walkable triangle soup (cooped xyz) for debug draw
 };
 
 struct ByteWriter {
@@ -133,6 +134,14 @@ inline std::vector<uint8_t> msgLightmap(const LightmapData& lm) {
 	ByteWriter w;
 	w.u8((uint8_t)MsgType::Lightmap);
 	writeLightmap(w, lm);
+	return w.data;
+}
+
+inline std::vector<uint8_t> msgNavMesh(const std::vector<float>& tris) {
+	ByteWriter w;
+	w.u8((uint8_t)MsgType::NavMesh);
+	w.u32((uint32_t)tris.size());
+	w.bytes(tris.data(), tris.size() * sizeof(float));
 	return w.data;
 }
 

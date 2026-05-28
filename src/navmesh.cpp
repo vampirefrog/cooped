@@ -33,6 +33,7 @@ void NavMesh::destroy() {
 
 bool NavMesh::build(const std::vector<Brush>& brushes) {
 	destroy();
+	m_debugTris.clear();
 
 	// World triangle soup in Recast (Y-up) space.
 	std::vector<float> verts;
@@ -104,6 +105,19 @@ bool NavMesh::build(const std::vector<Brush>& brushes) {
 		{ rcFreeCompactHeightfield(chf); rcFreeContourSet(cset); rcFreePolyMesh(pmesh); if (dmesh) rcFreePolyMeshDetail(dmesh); return false; }
 	rcFreeCompactHeightfield(chf);
 	rcFreeContourSet(cset);
+
+	// Capture the detail-mesh triangles (cooped coords) for the client's debug overlay.
+	for (int i = 0; i < dmesh->nmeshes; ++i) {
+		const unsigned int* msh = &dmesh->meshes[i * 4];
+		const unsigned int bverts = msh[0], btris = msh[2], ntris = msh[3];
+		for (unsigned int j = 0; j < ntris; ++j) {
+			const unsigned char* t = &dmesh->tris[(btris + j) * 4];
+			for (int k = 0; k < 3; ++k) {
+				float c[3]; swapYZ(&dmesh->verts[(bverts + t[k]) * 3], c);
+				m_debugTris.push_back(c[0]); m_debugTris.push_back(c[1]); m_debugTris.push_back(c[2]);
+			}
+		}
+	}
 
 	// Mark every walkable poly with flag 1 (the query filter includes it).
 	for (int i = 0; i < pmesh->npolys; ++i)
