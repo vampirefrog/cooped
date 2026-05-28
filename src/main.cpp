@@ -15,10 +15,12 @@
 
 #include <cstdio>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <thread>
 #include <vector>
 
 #include "brush.h"
@@ -209,6 +211,14 @@ struct App {
 	bgfx::TextureHandle lightmapTex = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle s_lightmap = BGFX_INVALID_HANDLE;
 	bool hasLightmap = false;
+#if !defined(__EMSCRIPTEN__)
+	// Async F6 bake: runs on a worker thread so the UI doesn't freeze; result uploaded on the
+	// main thread when done (bgfx is single-threaded). Native only.
+	std::thread bakeThread;
+	std::atomic<bool> bakeRunning{false};   // a bake is in flight (ignore new F6)
+	std::atomic<bool> bakeDone{false};       // worker finished; main thread should upload bakeResult
+	BakeResult bakeResult;                    // written by the worker, read by main after bakeDone
+#endif
 	bgfx::VertexBufferHandle lightWire = BGFX_INVALID_HANDLE;   // unit wireframe cube (line list)
 	uint32_t lightWireVerts = 0;
 	int placeColorIdx = 0;                                      // current light color to place
@@ -1099,19 +1109,20 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* event) {
 						case SDLK_RETURN: createBrushAtAim(app); break;
 						case SDLK_T: cycleTexture(app); break;
 #if !defined(__EMSCRIPTEN__)
-						case SDLK_F6: {  // GI bake: unwrap + shadowed direct light, then display it
-							const BakeResult br = bakeLightmaps(app->brushes, app->lights, app->lightmapTexelsPerUnit);
-							if (br.ok && !br.pixels.empty()) {
-								applyLightmapTexture(app, br.atlasWidth, br.atlasHeight, br.pixels, br.vertexUV);
-								if (app->online) {  // persist + share: server stores and ships it to everyone
-									LightmapData lm;
-									lm.w = br.atlasWidth; lm.h = br.atlasHeight;
-									lm.pixels = br.pixels; lm.vertexUV = br.vertexUV;
-									sendMsg(app, msgLightmap(lm));
-								}
+						case SDLK_F6: {  // GI bake on a worker thread; result uploaded when done (no UI freeze)
+							if (!app->bakeRunning.load()) {
+								app->bakeRunning.store(true);
+								app->bakeDone.store(false);
+								// Snapshot the scene so the worker is unaffected by concurrent edits.
+								std::vector<Brush> brushes = app->brushes;
+								std::vector<Light> lights = app->lights;
+								const float density = app->lightmapTexelsPerUnit;
+								app->bakeThread = std::thread(
+								    [app, brushes = std::move(brushes), lights = std::move(lights), density]() {
+									    app->bakeResult = bakeLightmaps(brushes, lights, density);
+									    app->bakeDone.store(true);
+								    });
 							}
-							SDL_Log("bake: ok=%d atlas %ux%u charts=%u", br.ok, br.atlasWidth, br.atlasHeight,
-							        br.chartCount);
 							break;
 						}
 #endif
@@ -1160,6 +1171,26 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	App* app = static_cast<App*>(appstate);
 
 	netPoll(app);  // apply any snapshot/edit ops from the server
+
+#if !defined(__EMSCRIPTEN__)
+	// A background bake finished: upload it (bgfx must run on this thread) and share it.
+	if (app->bakeDone.load()) {
+		if (app->bakeThread.joinable()) app->bakeThread.join();
+		app->bakeDone.store(false);
+		app->bakeRunning.store(false);
+		const BakeResult& br = app->bakeResult;
+		if (br.ok && !br.pixels.empty()) {
+			applyLightmapTexture(app, br.atlasWidth, br.atlasHeight, br.pixels, br.vertexUV);
+			if (app->online) {
+				LightmapData lm;
+				lm.w = br.atlasWidth; lm.h = br.atlasHeight;
+				lm.pixels = br.pixels; lm.vertexUV = br.vertexUV;
+				sendMsg(app, msgLightmap(lm));
+			}
+			SDL_Log("bake done: atlas %ux%u charts=%u", br.atlasWidth, br.atlasHeight, br.chartCount);
+		}
+	}
+#endif
 
 	const uint64_t now = SDL_GetTicksNS();
 	float dt = float(double(now - app->lastTicksNs) / 1.0e9);
@@ -1392,6 +1423,10 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 	bgfx::dbgTextClear();
 	if (app->versionMismatch)
 		bgfx::dbgTextPrintf(1, 5, 0x4f, " SERVER PROTOCOL MISMATCH - rebuild & restart the server ");
+#if !defined(__EMSCRIPTEN__)
+	if (app->bakeRunning.load())
+		bgfx::dbgTextPrintf(1, 7, 0x6f, " baking lightmap... (UI stays responsive) ");
+#endif
 	if (app->editMode) {
 		const uint16_t cols = uint16_t(app->width / 8), rows = uint16_t(app->height / 16);
 		bgfx::dbgTextPrintf(cols / 2, rows / 2, 0x0f, "+");  // crosshair
@@ -1420,6 +1455,9 @@ SDL_AppResult SDL_AppIterate(void* appstate) {
 void SDL_AppQuit(void* appstate, SDL_AppResult) {
 	App* app = static_cast<App*>(appstate);
 	if (!app) return;
+#if !defined(__EMSCRIPTEN__)
+	if (app->bakeThread.joinable()) app->bakeThread.join();  // let any in-flight bake finish
+#endif
 	if (app->bgfxInitialized) {
 		for (Mesh& m : app->meshes) m.destroy();
 		app->grid.destroy();
